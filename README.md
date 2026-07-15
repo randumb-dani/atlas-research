@@ -2,7 +2,7 @@
 
 A deep research agent that connects to LM Studio for local LLM inference and uses crw (MCP server) for web research capabilities.
 
-!(git-header.png)
+![ad](git-header.png)
 
 ## Overview
 
