@@ -2,6 +2,8 @@
 
 A deep research agent that connects to LM Studio for local LLM inference and uses crw (MCP server) for web research capabilities.
 
+!(git-header.png)
+
 ## Overview
 
 Atlas is a desktop application built with Tauri 2, React 19, and TypeScript 6. It acts as an MCP (Model Context Protocol) client that:

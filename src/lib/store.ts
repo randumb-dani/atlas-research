@@ -119,10 +119,13 @@ export interface SessionState {
   loadSession: (entry: HistoryEntry) => void;
 }
 
-/** Hard cap on in-memory SSE events per subagent. Events beyond this limit
- * are dropped from the front (oldest first). This prevents memory from growing
- * unboundedly during long research runs with many tool-call iterations. */
-const MAX_SUBAGENT_EVENTS = 200;
+/** Hard cap on persisted SSE events per subagent in the store. Events beyond
+ * this limit are dropped from the front (oldest first), so the most recent
+ * events — the ones the live view renders — are always preserved. The LIVE
+ * view reads from the unbounded in-memory buffer in live-events.ts, so what
+ * the user sees during a run is never trimmed; this cap only bounds the
+ * persisted/store copy used for reloads. */
+const MAX_SUBAGENT_EVENTS = 600;
 
 function loadInitialState() {
   try {
@@ -347,8 +350,12 @@ export const useSessionStore = create<SessionState>((set) => ({
     try {
       localStorage.removeItem(SESSION_KEY);
     } catch {}
+    // Use baseInitialState (the clean idle snapshot), NOT the hydrated
+    // `initialState`: after a reload `initialState` carries the restored
+    // in-flight phase and subagents, so spreading it would RE-APPLY the
+    // interrupted run and Cancel would appear to do nothing.
     set((state) => ({
-      ...initialState,
+      ...baseInitialState,
       orchestratorModel: state.orchestratorModel,
       subagentModel: state.subagentModel,
       toolset: state.toolset,

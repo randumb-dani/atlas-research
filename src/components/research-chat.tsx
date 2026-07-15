@@ -21,6 +21,7 @@ import { loadHistory, addEntry, deleteEntry, clearHistory } from "@/lib/history"
 import type { HistoryEntry } from "@/lib/history";
 import { HistoryPanel } from "@/components/history-panel";
 import { mailboxToolSource, registerAgent as mailboxRegister, deregisterAgent as mailboxDeregister, resetMailbox, resetCycleAgents, collectUndelivered, drainInbox } from "@/lib/mailbox-local";
+import { pushLiveEvent, resetLiveEvents, useLiveEvents } from "@/lib/live-events";
 import { playSound, preloadSounds } from "@/lib/sounds";
 import { useIsMobile } from "@/hooks/use-is-mobile";
 import {
@@ -336,6 +337,7 @@ const handleStart = useCallback(async () => {
     const preservedToolset = s.toolset;
     s.reset();
     resetMailbox();
+    resetLiveEvents();
     cancelRef.current = new AbortController();
     store.getState().setOrchestratorModel(orchModel);
     store.getState().setSubagentModel(subModel);
@@ -348,6 +350,7 @@ const handleStart = useCallback(async () => {
     cancelRef.current?.abort();
     cancelRef.current = null;
     resetMailbox();
+    resetLiveEvents();
     const preservedToolset = useSessionStore.getState().toolset;
     useSessionStore.getState().reset();
     if (preservedToolset) useSessionStore.getState().setToolset(preservedToolset);
@@ -358,6 +361,7 @@ const handleStart = useCallback(async () => {
 
   const handleRestoreSession = useCallback((entry: HistoryEntry) => {
     restoringRef.current = true;
+    resetLiveEvents();
     useSessionStore.getState().loadSession(entry);
     setInput(entry.query);
     setSelectedAgentKey(null);
@@ -582,6 +586,7 @@ HARD CONSTRAINTS:
           signal: cancelRef.current?.signal,
           onEvent: (event) => {
             if (event.type === "error" && event.error.type === "iteration_cap") hitCap = true;
+            pushLiveEvent(key, event);
             store.getState().addSubagentEvent(key, event);
           },
         });
@@ -1417,6 +1422,15 @@ function ResearchDetailView({
   const eventLogRef = useRef<HTMLDivElement>(null);
   const [eventUserScrolledUp, setEventUserScrolledUp] = useState(false);
 
+  // Live, render-decoupled event stream for the selected subagent. This reads
+  // from the in-memory buffer (live-events.ts) on a rAF loop so streaming stays
+  // smooth even while the store is churning under crw/search latency. Falls
+  // back to the store's persisted events when the buffer is empty (e.g. after
+  // a reload).
+  const liveEvents = useLiveEvents(selectedAgent?.key ?? null);
+  const effectiveEvents =
+    liveEvents.length > 0 ? liveEvents : (selectedAgent?.events ?? []);
+
   useEffect(() => {
     detailScrollRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [selectedAgent?.events, selectedAgent?.report, compiledReport]);
@@ -1432,7 +1446,7 @@ function ResearchDetailView({
     if (eventUserScrolledUp) return;
     const el = eventLogRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [selectedAgent?.events, selectedAgent?.report, eventUserScrolledUp]);
+  }, [effectiveEvents, selectedAgent?.report, eventUserScrolledUp]);
 
   const handleEventLogScroll = useCallback(() => {
     const el = eventLogRef.current;
@@ -1558,7 +1572,7 @@ function ResearchDetailView({
               Event Log
             </div>
             <div ref={eventLogRef} onScroll={handleEventLogScroll} className="max-h-[500px] overflow-y-auto">
-              <SSETimeline events={selectedAgent?.events || []} />
+              <SSETimeline events={effectiveEvents} />
             </div>
           </div>
 

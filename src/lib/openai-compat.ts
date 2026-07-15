@@ -175,12 +175,16 @@ export async function streamChatCompletion(
       } catch {
         // Arguments didn't parse as JSON even after full accumulation — this
         // means either the stream was cut short or the model produced
-        // malformed JSON. Surface it as an error rather than silently
-        // guessing at partial arguments.
-        callbacks.onError?.(
-          new Error(`Tool call "${entry.name}" returned unparseable arguments: ${entry.arguments.slice(0, 200)}`)
+        // malformed/non-JSON arguments (e.g. XML-style <parameter> tags).
+        // Rather than DROP the call and surface a scary "tool failed" error
+        // (which is exactly what makes a harmless check_inbox look like a
+        // failure), recover with empty args and let the tool itself decide
+        // what to do. Mailbox tools tolerate missing keys; crw tools will
+        // report a real error if an argument they need is genuinely absent.
+        console.warn(
+          `Tool call "${entry.name}" had unparseable arguments (recovered as empty): ${entry.arguments.slice(0, 200)}`,
         );
-        continue;
+        parsedArgs = {};
       }
       toolCalls.push({ id: entry.id, name: entry.name, arguments: parsedArgs });
       callbacks.onToolCallReady?.({ id: entry.id, name: entry.name, arguments: parsedArgs });
