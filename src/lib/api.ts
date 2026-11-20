@@ -1,6 +1,9 @@
 import type { ChatRequest, ChatResponse, LMModel, LoadRequest, LoadResponse, SSEEvent, UnloadRequest, UnloadResponse } from "./types";
-import { useSessionStore } from "./store";
 import { httpFetch } from "./http";
+import { DEFAULT_STALL_TIMEOUTS, StallTimeoutError, StallWatcher, type StallTimeouts } from "./fetch-timeout";
+import { mcpListTools } from "./mcp-client";
+import { resolveLlmTarget } from "./llm-provider";
+import { streamChatAsSSE } from "./openai-compat";
 
 function toErrorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -15,10 +18,6 @@ function toErrorMessage(err: unknown): string {
     }
   }
   return "Unknown error";
-}
-
-function lmStudioBase(): string {
-  return useSessionStore.getState().lmStudioUrl || "http://127.0.0.1:1234";
 }
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
@@ -41,38 +40,164 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
+/**
+ * Maps one OpenAI-compatible `/v1/models` entry onto the app's richer
+ * LMModel shape. Open servers disagree about which optional fields they
+ * include (Unsloth reports `loaded`; plain llama-server omits it), so every
+ * field is read defensively and unknown metadata stays null rather than
+ * inventing values the UI would then present as fact.
+ */
+function mapOpenAIModel(raw: unknown): LMModel | null {
+  if (!raw || typeof raw !== "object") return null;
+  const m = raw as Record<string, unknown>;
+  const key =
+    typeof m.id === "string" ? m.id : typeof m.model === "string" ? m.model : "";
+  if (!key) return null;
+
+  const label =
+    (typeof m.name === "string" && m.name.trim()) ||
+    (typeof m.display_name === "string" && m.display_name.trim()) ||
+    key;
+  const rawType = typeof m.type === "string" ? m.type.toLowerCase() : "";
+  const isEmbedding = rawType === "embedding" || rawType === "embeddings";
+  const loaded = m.loaded === true ? true : m.loaded === false ? false : undefined;
+  const contextLength =
+    Number(m.max_context_length ?? m.context_length ?? 0) || 0;
+  const sizeBytes = Number(m.size_bytes ?? m.size ?? 0) || 0;
+
+  return {
+    type: isEmbedding ? "embedding" : "llm",
+    publisher:
+      typeof m.owned_by === "string" && m.owned_by.trim()
+        ? m.owned_by
+        : "unsloth",
+    key,
+    display_name: label,
+    architecture: typeof m.architecture === "string" ? m.architecture : null,
+    quantization: null,
+    size_bytes: sizeBytes,
+    params_string:
+      typeof m.params_string === "string"
+        ? m.params_string
+        : typeof m.parameters === "string"
+          ? m.parameters
+          : null,
+    // Unknown load state is treated as usable; only an explicit `loaded: false`
+    // marks a model as needing to be loaded inside the server's own app.
+    loaded_instances:
+      loaded === false
+        ? []
+        : [{ id: key, config: { context_length: contextLength } }],
+    max_context_length: contextLength,
+    format: null,
+    capabilities: undefined,
+    description: typeof m.description === "string" ? m.description : null,
+    loaded,
+  };
+}
+
 export async function listModels(): Promise<LMModel[]> {
-  const data = await request<{ models: LMModel[] }>(`${lmStudioBase()}/api/v1/models`);
-  return data.models;
+  const target = resolveLlmTarget();
+
+  if (target.info.nativeApi) {
+    const data = await request<{ models: LMModel[] }>(
+      `${target.baseUrl}/api/v1/models`,
+    );
+    return data.models;
+  }
+
+  // OpenAI-compatible backends (Unsloth Studio, llama-server, vLLM, …) expose
+  // only the standard list endpoint; `data` is the spec shape, `models` the
+  // llama.cpp variant.
+  const data = await request<{ data?: unknown[]; models?: unknown[] }>(
+    `${target.baseUrl}/v1/models`,
+    { headers: target.headers },
+  );
+  const raw = Array.isArray(data.data)
+    ? data.data
+    : Array.isArray(data.models)
+      ? data.models
+      : [];
+  const seen = new Set<string>();
+  const models: LMModel[] = [];
+  for (const item of raw) {
+    const mapped = mapOpenAIModel(item);
+    if (!mapped || seen.has(mapped.key)) continue;
+    seen.add(mapped.key);
+    models.push(mapped);
+  }
+  return models;
 }
 
 export async function loadModel(req: LoadRequest): Promise<LoadResponse> {
-  return request(`${lmStudioBase()}/api/v1/models/load`, {
+  const target = resolveLlmTarget();
+  if (!target.info.nativeApi) {
+    throw new Error(
+      `${target.info.label} loads models inside its own app — select and load a model there, then refresh the list here.`,
+    );
+  }
+  return request(`${target.baseUrl}/api/v1/models/load`, {
     method: "POST",
     body: JSON.stringify(req),
   });
 }
 
 export async function unloadModel(req: UnloadRequest): Promise<UnloadResponse> {
-  return request(`${lmStudioBase()}/api/v1/models/unload`, {
+  const target = resolveLlmTarget();
+  if (!target.info.nativeApi) {
+    throw new Error(
+      `${target.info.label} manages model lifetime itself — unload the model from its app.`,
+    );
+  }
+  return request(`${target.baseUrl}/api/v1/models/unload`, {
     method: "POST",
     body: JSON.stringify(req),
   });
 }
 
+/** Non-streaming single turn (native LM Studio API only; the app's research
+ * flow streams through `streamChat`). */
 export async function chat(req: ChatRequest): Promise<ChatResponse> {
-  return request(`${lmStudioBase()}/api/v1/chat`, {
+  const target = resolveLlmTarget();
+  if (!target.info.nativeApi) {
+    throw new Error(`${target.info.label} supports streaming via /v1/chat/completions only.`);
+  }
+  return request(`${target.baseUrl}/api/v1/chat`, {
     method: "POST",
     body: JSON.stringify(req),
   });
 }
 
+/**
+ * Orchestrator streaming entry point.
+ *
+ * LM Studio keeps using its native `/api/v1/chat` endpoint (server-side
+ * history via `previous_response_id`, auto model-load). OpenAI-compatible
+ * backends such as Unsloth Studio get the same event contract synthesized
+ * from `/v1/chat/completions` — see `streamChatAsSSE` in openai-compat.ts.
+ */
 export function streamChat(
   req: ChatRequest,
   onEvent: (event: SSEEvent) => void,
   onError: (error: Error) => void,
   onDone: () => void,
   externalSignal?: AbortSignal,
+  stall?: StallTimeouts,
+): AbortController {
+  const target = resolveLlmTarget();
+  if (!target.info.nativeApi) {
+    return streamChatAsSSE(req, onEvent, onError, onDone, externalSignal, stall);
+  }
+  return streamChatLmStudio(req, onEvent, onError, onDone, externalSignal, stall);
+}
+
+function streamChatLmStudio(
+  req: ChatRequest,
+  onEvent: (event: SSEEvent) => void,
+  onError: (error: Error) => void,
+  onDone: () => void,
+  externalSignal?: AbortSignal,
+  stall?: StallTimeouts,
 ): AbortController {
   const controller = new AbortController();
 
@@ -85,8 +210,25 @@ export function streamChat(
   }
 
   (async () => {
+    const timeouts = { ...DEFAULT_STALL_TIMEOUTS, ...stall };
+    // A stalled orchestrator stream (planning/gap-check/compile) used to hang
+    // the whole run silently. The watcher aborts the request and reports a
+    // StallTimeoutError so the caller can fail loudly instead.
+    let stalled: StallTimeoutError | null = null;
+    const watcher = new StallWatcher((kind) => {
+      stalled = new StallTimeoutError(
+        kind,
+        kind === "time-to-first-token" ? timeouts.timeToFirstTokenMs : timeouts.interTokenMs,
+      );
+      try {
+        onError(stalled);
+      } catch {
+        // never let a watcher callback throw
+      }
+      controller.abort(stalled);
+    }, timeouts);
     try {
-      const res = await httpFetch(`${lmStudioBase()}/api/v1/chat`, {
+      const res = await httpFetch(`${resolveLlmTarget().baseUrl}/api/v1/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...req, stream: true }),
@@ -107,6 +249,7 @@ export function streamChat(
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        watcher.progress();
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
@@ -124,8 +267,15 @@ export function streamChat(
         }
       }
 
+      watcher.done();
       onDone();
     } catch (err) {
+      watcher.done();
+      if (stalled) {
+        // Already reported via onError in the stall handler; the abort we
+        // triggered ourselves just unwinds the reader loop.
+        return;
+      }
       if (err instanceof Error && err.name !== "AbortError") {
         onError(err);
       }
@@ -136,17 +286,43 @@ export function streamChat(
 }
 
 export async function crwToolsList(crwUrl: string, apiKey?: string): Promise<string[]> {
-  const headers = apiKey ? { "Authorization": `Bearer ${apiKey}` } : undefined;
-  const data = await request<{ result?: { tools: { name: string }[] } }>(`${crwUrl}/mcp`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: "1",
-      method: "tools/list",
-    }),
-  });
-  return data.result?.tools?.map((t) => t.name) ?? [];
+  const tools = await mcpListTools(`${crwUrl}/mcp`, apiKey, { timeoutMs: 15_000 });
+  return tools.map((t) => t.name);
+}
+
+export interface LlmTestResult {
+  success: boolean;
+  provider: string;
+  baseUrl: string;
+  /** Model ids reported by the backend, on success. */
+  models?: string[];
+  error?: string;
+}
+
+/**
+ * Probes the *selected* inference backend through the exact code path the
+ * research run uses (`listModels`), so a green result means Settings is
+ * actually usable — a keyless Unsloth endpoint answers 401 here, which is
+ * the failure users hit most often.
+ */
+export async function testLlmConnection(): Promise<LlmTestResult> {
+  const target = resolveLlmTarget();
+  try {
+    const models = await listModels();
+    return {
+      success: true,
+      provider: target.info.label,
+      baseUrl: target.baseUrl,
+      models: models.filter((m) => m.type === "llm").map((m) => m.key),
+    };
+  } catch (err) {
+    return {
+      success: false,
+      provider: target.info.label,
+      baseUrl: target.baseUrl,
+      error: toErrorMessage(err),
+    };
+  }
 }
 
 export interface CrwTestResult {
@@ -157,17 +333,12 @@ export interface CrwTestResult {
 
 export async function testCrwConnection(crwUrl: string, apiKey?: string): Promise<CrwTestResult> {
   try {
-    const headers = apiKey ? { "Authorization": `Bearer ${apiKey}` } : undefined;
-    const data = await request<{ result?: { tools: { name: string }[] } }>(`${crwUrl}/mcp`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: "1",
-        method: "tools/list",
-      }),
-    });
-    return { success: true, tools: data.result?.tools?.map((t) => t.name) ?? [] };
+    // Same path the research loop itself uses (initialize handshake +
+    // tools/list via mcp-client), so "Test" passing actually means research
+    // will work — previously this used a hand-rolled tools/list call that
+    // could succeed where the real path failed and vice versa.
+    const tools = await crwToolsList(crwUrl, apiKey);
+    return { success: true, tools };
   } catch (err) {
     return { success: false, error: toErrorMessage(err) };
   }

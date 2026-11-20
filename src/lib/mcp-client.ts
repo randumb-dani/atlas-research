@@ -12,6 +12,7 @@
  */
 
 import { httpFetch } from "./http";
+import { linkSignals, TimeoutError } from "./fetch-timeout";
 
 export interface McpToolDef {
   name: string;
@@ -39,10 +40,25 @@ interface JsonRpcResponse<T> {
 
 let rpcId = 0;
 
-/** The session ID to forward as a header on every RPC, if crw provides one. */
-let sessionId: string | undefined;
+/**
+ * Session IDs scoped per server URL. Previously a single module-global,
+ * which leaked one server's session onto every other server's requests.
+ */
+const sessionIds = new Map<string, string>();
 
-async function rpcCall<T>(serverUrl: string, method: string, params?: Record<string, unknown>, apiKey?: string): Promise<T> {
+export interface RpcOptions {
+  signal?: AbortSignal;
+  /** Per-call timeout in ms. No timeout when undefined. */
+  timeoutMs?: number;
+}
+
+async function rpcCall<T>(
+  serverUrl: string,
+  method: string,
+  params?: Record<string, unknown>,
+  apiKey?: string,
+  opts?: RpcOptions,
+): Promise<T> {
   const id = ++rpcId;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -52,6 +68,7 @@ async function rpcCall<T>(serverUrl: string, method: string, params?: Record<str
   };
 
   // Forward the session ID from initialize if crw (or any MCP server) provides one.
+  const sessionId = sessionIds.get(serverUrl);
   if (sessionId !== undefined) {
     headers["Mcp-Session-Id"] = sessionId;
   }
@@ -62,11 +79,23 @@ async function rpcCall<T>(serverUrl: string, method: string, params?: Record<str
     headers["Authorization"] = `Bearer ${apiKey}`;
   }
 
-  const res = await httpFetch(serverUrl, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} }),
-  });
+  const linked = linkSignals([opts?.signal], opts?.timeoutMs);
+  let res: Response;
+  try {
+    res = await httpFetch(serverUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} }),
+      signal: linked.signal,
+    });
+  } catch (err) {
+    if (linked.signal.aborted && linked.signal.reason instanceof TimeoutError) {
+      throw new Error(`MCP ${method} timed out after ${opts?.timeoutMs}ms (${serverUrl})`);
+    }
+    throw err;
+  } finally {
+    linked.cancel();
+  }
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -108,17 +137,19 @@ async function rpcCall<T>(serverUrl: string, method: string, params?: Record<str
  * don't hard-fail if the server doesn't implement it, since many minimal
  * servers (including hand-rolled ones) skip it entirely.
  */
-export async function mcpListTools(serverUrl: string, apiKey?: string): Promise<McpToolDef[]> {
+export async function mcpListTools(serverUrl: string, apiKey?: string, opts?: RpcOptions): Promise<McpToolDef[]> {
   // Capture the session ID from initialize so subsequent RPCs can reference this session.
   const initResult = await rpcCall<{ session?: string }>(serverUrl, "initialize", {
     protocolVersion: "2024-11-05",
     capabilities: {},
     clientInfo: { name: "deep-research-tauri", version: "0.1.0" },
-  }, apiKey).catch((err) => {
+  }, apiKey, opts).catch((err) => {
     console.warn("[mcp] initialize failed:", err);
     return {} as { session?: string };
   });
-  sessionId = initResult.session;
+  if (initResult.session) {
+    sessionIds.set(serverUrl, initResult.session);
+  }
 
   try {
     const result = await rpcCall<{ tools: McpToolDef[] }>(serverUrl, "tools/list", undefined, apiKey);
@@ -134,8 +165,9 @@ export async function mcpCallTool(
   name: string,
   args: Record<string, unknown>,
   apiKey?: string,
+  opts?: RpcOptions,
 ): Promise<McpCallResult> {
-  return rpcCall<McpCallResult>(serverUrl, "tools/call", { name, arguments: args }, apiKey);
+  return rpcCall<McpCallResult>(serverUrl, "tools/call", { name, arguments: args }, apiKey, opts);
 }
 
 /** Flattens an MCP tool-call result into a single string, suitable for a tool-role message. */

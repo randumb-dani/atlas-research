@@ -10,11 +10,11 @@ interface SubagentStatusProps {
 }
 
 const statusDotColor: Record<SubagentState["status"], string> = {
-  pending: "bg-muted-foreground",
-  planning: "bg-blue-500",
-  researching: "bg-primary",
-  reporting: "bg-primary",
-  done: "bg-green-500",
+  pending: "bg-muted-foreground/40",
+  planning: "bg-event-info",
+  researching: "bg-primary animate-pulse-soft",
+  reporting: "bg-event-processing animate-pulse-soft",
+  done: "bg-success",
 };
 
 const statusLabel: Record<SubagentState["status"], string> = {

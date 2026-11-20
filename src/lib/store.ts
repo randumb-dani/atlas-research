@@ -1,7 +1,25 @@
 import { create } from "zustand";
 import type { SSEEvent } from "./types";
 import type { ResolvedToolset } from "./tool-types";
+import type { BuiltinEngineId } from "./search-engines";
 import type { HistoryEntry } from "./history";
+
+const BUILTIN_ENGINE_IDS: BuiltinEngineId[] = ["ddg", "bing", "mojeek", "brave", "wikipedia"];
+const DEFAULT_BUILTIN_ENGINES: BuiltinEngineId[] = [...BUILTIN_ENGINE_IDS];
+
+function normalizeEngines(value: unknown): BuiltinEngineId[] {
+  if (!Array.isArray(value)) return [...DEFAULT_BUILTIN_ENGINES];
+  const seen = new Set<BuiltinEngineId>();
+  for (const raw of value) {
+    const id = String(raw).toLowerCase() as BuiltinEngineId;
+    if (BUILTIN_ENGINE_IDS.includes(id)) seen.add(id);
+  }
+  return [...seen];
+}
+
+/** Which local inference backend Atlas talks to. Both speak
+ * `/v1/chat/completions`; only LM Studio has a native model-management API. */
+export type LlmProvider = "lmstudio" | "unsloth";
 
 export type SessionPhase =
   | "idle"
@@ -83,8 +101,38 @@ export interface SessionState {
   interrupted: boolean;
   crwUrl: string;
   crwApiKey: string;
+  /** Selected inference backend (LM Studio by default). */
+  llmProvider: LlmProvider;
+  /** Base URL for LM Studio (used when llmProvider === "lmstudio"). */
   lmStudioUrl: string;
+  /** Base URL for Unsloth Studio (used when llmProvider === "unsloth"). */
+  unslothUrl: string;
+  /** Bearer token for Unsloth Studio (`sk-unsloth-…`); "" when unset. */
+  unslothApiKey: string;
   toolset: ResolvedToolset | null;
+  /** Search provider order: built-in engine pool first (default), DDG-direct
+   * primary with crw failover, or self-hosted SearXNG/crw first. */
+  searchProviderOrder: "builtin-first" | "ddg-first" | "crw-first" | "searxng-first";
+  /** Self-hosted SearXNG base URL ("" = disabled, chain skips it). */
+  searxngUrl: string;
+  /** Min ms between DDG search starts (DDG throttles bursty IPs). */
+  ddgMinIntervalMs: number;
+  /** Per-search network timeout (applies to both providers). */
+  searchTimeoutMs: number;
+  /** Per-scrape network timeout. */
+  scrapeTimeoutMs: number;
+  /** Built-in multi-engine search pool (DDG/Bing/Mojeek/Brave/Wikipedia). */
+  builtinSearchEngines: BuiltinEngineId[];
+  /** Honour robots.txt Disallow + Crawl-delay in the built-in scraper. */
+  robotsRespect: boolean;
+  /** Min ms between fetches to the same host. */
+  scrapeMinIntervalMs: number;
+  /** Max concurrent fetches per host (shared across subagents). */
+  scrapeMaxConcurrent: number;
+  /** Max response bytes the scraper will read. */
+  maxPageBytes: number;
+  /** Allow loopback/LAN/.local targets (SSRF guard opt-out). */
+  allowPrivateHosts: boolean;
 
   // --- Actions ---
 
@@ -113,8 +161,22 @@ export interface SessionState {
   setInterrupted: (v: boolean) => void;
   setCrwUrl: (url: string) => void;
   setCrwApiKey: (key: string) => void;
+  setLlmProvider: (p: LlmProvider) => void;
   setLmStudioUrl: (url: string) => void;
+  setUnslothUrl: (url: string) => void;
+  setUnslothApiKey: (key: string) => void;
   setToolset: (t: ResolvedToolset | null) => void;
+  setSearchProviderOrder: (o: "builtin-first" | "ddg-first" | "crw-first" | "searxng-first") => void;
+  setSearxngUrl: (url: string) => void;
+  setDdgMinIntervalMs: (ms: number) => void;
+  setSearchTimeoutMs: (ms: number) => void;
+  setScrapeTimeoutMs: (ms: number) => void;
+  setBuiltinSearchEngines: (engines: BuiltinEngineId[]) => void;
+  setRobotsRespect: (v: boolean) => void;
+  setScrapeMinIntervalMs: (ms: number) => void;
+  setScrapeMaxConcurrent: (n: number) => void;
+  setMaxPageBytes: (bytes: number) => void;
+  setAllowPrivateHosts: (v: boolean) => void;
   reset: () => void;
   loadSession: (entry: HistoryEntry) => void;
 }
@@ -127,24 +189,109 @@ export interface SessionState {
  * persisted/store copy used for reloads. */
 const MAX_SUBAGENT_EVENTS = 600;
 
-function loadInitialState() {
+function loadInitialState(): {
+  crwUrl: string;
+  crwApiKey: string;
+  llmProvider: LlmProvider;
+  lmStudioUrl: string;
+  unslothUrl: string;
+  unslothApiKey: string;
+  orchestratorModel: string | null;
+  subagentModel: string | null;
+  searchProviderOrder: "builtin-first" | "ddg-first" | "crw-first" | "searxng-first";
+  searxngUrl: string;
+  ddgMinIntervalMs: number;
+  searchTimeoutMs: number;
+  scrapeTimeoutMs: number;
+  builtinSearchEngines: BuiltinEngineId[];
+  robotsRespect: boolean;
+  scrapeMinIntervalMs: number;
+  scrapeMaxConcurrent: number;
+  maxPageBytes: number;
+  allowPrivateHosts: boolean;
+} {
   try {
     const saved = localStorage.getItem("deep-research-config");
     if (saved) {
       const parsed = JSON.parse(saved);
+      const orderRaw = parsed.searchProviderOrder;
       return {
         crwUrl: parsed.crwUrl || "http://127.0.0.1:3100",
         crwApiKey: parsed.crwApiKey || "",
+        llmProvider: parsed.llmProvider === "unsloth" ? "unsloth" : "lmstudio",
         lmStudioUrl: parsed.lmStudioUrl || "http://127.0.0.1:1234",
+        unslothUrl: parsed.unslothUrl || "http://127.0.0.1:8888",
+        unslothApiKey: typeof parsed.unslothApiKey === "string" ? parsed.unslothApiKey : "",
         orchestratorModel: parsed.orchestratorModel || null,
         subagentModel: parsed.subagentModel || null,
+        searchProviderOrder:
+          orderRaw === "ddg-first" || orderRaw === "crw-first" || orderRaw === "searxng-first" || orderRaw === "builtin-first"
+            ? orderRaw
+            : "builtin-first",
+        searxngUrl: typeof parsed.searxngUrl === "string" ? parsed.searxngUrl : "",
+        ddgMinIntervalMs: numOr(parsed.ddgMinIntervalMs, 2000),
+        searchTimeoutMs: numOr(parsed.searchTimeoutMs, 30_000),
+        scrapeTimeoutMs: numOr(parsed.scrapeTimeoutMs, 60_000),
+        builtinSearchEngines: normalizeEngines(parsed.builtinSearchEngines),
+        robotsRespect: parsed.robotsRespect !== false,
+        scrapeMinIntervalMs: numOr(parsed.scrapeMinIntervalMs, 1500),
+        scrapeMaxConcurrent: Math.min(8, Math.max(1, numOr(parsed.scrapeMaxConcurrent, 2))),
+        maxPageBytes: numOr(parsed.maxPageBytes, 2_000_000),
+        allowPrivateHosts: parsed.allowPrivateHosts === true,
       };
     }
   } catch {}
-  return { crwUrl: "http://127.0.0.1:3100", crwApiKey: "", lmStudioUrl: "http://127.0.0.1:1234", orchestratorModel: null, subagentModel: null };
+  return {
+    crwUrl: "http://127.0.0.1:3100",
+    crwApiKey: "",
+    llmProvider: "lmstudio" as const,
+    lmStudioUrl: "http://127.0.0.1:1234",
+    unslothUrl: "http://127.0.0.1:8888",
+    unslothApiKey: "",
+    orchestratorModel: null,
+    subagentModel: null,
+    searchProviderOrder: "builtin-first" as const,
+    searxngUrl: "",
+    ddgMinIntervalMs: 2000,
+    searchTimeoutMs: 30_000,
+    scrapeTimeoutMs: 60_000,
+    builtinSearchEngines: [...DEFAULT_BUILTIN_ENGINES],
+    robotsRespect: true,
+    scrapeMinIntervalMs: 1500,
+    scrapeMaxConcurrent: 2,
+    maxPageBytes: 2_000_000,
+    allowPrivateHosts: false,
+  };
 }
 
-const { crwUrl: initUrl, crwApiKey: initKey, lmStudioUrl: initLmUrl, orchestratorModel: initOrchModel, subagentModel: initSubModel } = loadInitialState();
+function numOr(value: unknown, fallback: number): number {
+  // 0 is a legitimate persisted value (e.g. scrapeMinIntervalMs: 0 = no
+  // spacing), so only reject missing/non-finite/negative values.
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+const {
+  crwUrl: initUrl,
+  crwApiKey: initKey,
+  llmProvider: initLlmProvider,
+  lmStudioUrl: initLmUrl,
+  unslothUrl: initUnslothUrl,
+  unslothApiKey: initUnslothKey,
+  orchestratorModel: initOrchModel,
+  subagentModel: initSubModel,
+  searchProviderOrder: initOrder,
+  searxngUrl: initSearxngUrl,
+  ddgMinIntervalMs: initInterval,
+  searchTimeoutMs: initSearchTimeout,
+  scrapeTimeoutMs: initScrapeTimeout,
+  builtinSearchEngines: initBuiltinEngines,
+  robotsRespect: initRobotsRespect,
+  scrapeMinIntervalMs: initScrapeInterval,
+  scrapeMaxConcurrent: initScrapeConcurrent,
+  maxPageBytes: initMaxPageBytes,
+  allowPrivateHosts: initAllowPrivateHosts,
+} = loadInitialState();
 
 // --- Live session persistence (so a reload returns to the page you were on) ---
 const SESSION_KEY = "deep-research-session";
@@ -217,8 +364,22 @@ const baseInitialState = {
   interrupted: false,
   crwUrl: initUrl,
   crwApiKey: initKey,
+  llmProvider: initLlmProvider,
   lmStudioUrl: initLmUrl,
+  unslothUrl: initUnslothUrl,
+  unslothApiKey: initUnslothKey,
   toolset: null as ResolvedToolset | null,
+  searchProviderOrder: initOrder,
+  searxngUrl: initSearxngUrl,
+  ddgMinIntervalMs: initInterval,
+  searchTimeoutMs: initSearchTimeout,
+  scrapeTimeoutMs: initScrapeTimeout,
+  builtinSearchEngines: initBuiltinEngines,
+  robotsRespect: initRobotsRespect,
+  scrapeMinIntervalMs: initScrapeInterval,
+  scrapeMaxConcurrent: initScrapeConcurrent,
+  maxPageBytes: initMaxPageBytes,
+  allowPrivateHosts: initAllowPrivateHosts,
 };
 
 // Rehydrate a previously persisted session so a reload drops you back on the
@@ -234,16 +395,38 @@ const initialState = persistedSession
     }
   : baseInitialState;
 
-function saveConfig(url: string, key: string, lmUrl?: string, orchModel?: string | null, subModel?: string | null) {
+/**
+ * Persist the connection-level config. Reads the live store rather than
+ * taking arguments so adding a setting can never be forgotten at one call
+ * site (that's how a newly added provider URL silently stopped persisting
+ * before). Call it AFTER the state update.
+ */
+function persistConfig() {
   try {
     const current = JSON.parse(localStorage.getItem("deep-research-config") || "{}");
+    const s = useSessionStore.getState();
     localStorage.setItem("deep-research-config", JSON.stringify({
       ...current,
-      crwUrl: url,
-      crwApiKey: key,
-      lmStudioUrl: lmUrl ?? current.lmStudioUrl ?? "http://localhost:1234",
-      orchestratorModel: orchModel ?? current.orchestratorModel ?? null,
-      subagentModel: subModel ?? current.subagentModel ?? null,
+      crwUrl: s.crwUrl,
+      crwApiKey: s.crwApiKey,
+      llmProvider: s.llmProvider,
+      lmStudioUrl: s.lmStudioUrl,
+      unslothUrl: s.unslothUrl,
+      unslothApiKey: s.unslothApiKey,
+      orchestratorModel: s.orchestratorModel ?? null,
+      subagentModel: s.subagentModel ?? null,
+      // Search tuning lives with the connection config so it survives reloads.
+      searchProviderOrder: s.searchProviderOrder,
+      searxngUrl: s.searxngUrl,
+      ddgMinIntervalMs: s.ddgMinIntervalMs,
+      searchTimeoutMs: s.searchTimeoutMs,
+      scrapeTimeoutMs: s.scrapeTimeoutMs,
+      builtinSearchEngines: s.builtinSearchEngines,
+      robotsRespect: s.robotsRespect,
+      scrapeMinIntervalMs: s.scrapeMinIntervalMs,
+      scrapeMaxConcurrent: s.scrapeMaxConcurrent,
+      maxPageBytes: s.maxPageBytes,
+      allowPrivateHosts: s.allowPrivateHosts,
     }));
   } catch {}
 }
@@ -251,14 +434,12 @@ function saveConfig(url: string, key: string, lmUrl?: string, orchModel?: string
 export const useSessionStore = create<SessionState>((set) => ({
   ...initialState,
   setOrchestratorModel: (m) => {
-    const s = useSessionStore.getState();
-    saveConfig(s.crwUrl, s.crwApiKey, s.lmStudioUrl, m, undefined);
     set({ orchestratorModel: m });
+    persistConfig();
   },
   setSubagentModel: (m) => {
-    const s = useSessionStore.getState();
-    saveConfig(s.crwUrl, s.crwApiKey, s.lmStudioUrl, undefined, m);
     set({ subagentModel: m });
+    persistConfig();
   },
   setPhase: (p) => set({ phase: p }),
   setCycle: (c) => set({ cycle: c }),
@@ -323,21 +504,76 @@ export const useSessionStore = create<SessionState>((set) => ({
   setError: (e) => set({ error: e }),
   setInterrupted: (v) => set({ interrupted: v }),
   setCrwUrl: (url) => {
-    const s = useSessionStore.getState();
-    saveConfig(url, s.crwApiKey, s.lmStudioUrl);
     set({ crwUrl: url });
+    persistConfig();
   },
   setCrwApiKey: (key) => {
-    const s = useSessionStore.getState();
-    saveConfig(s.crwUrl, key, s.lmStudioUrl);
     set({ crwApiKey: key });
+    persistConfig();
+  },
+  setLlmProvider: (p) => {
+    set({ llmProvider: p });
+    persistConfig();
   },
   setLmStudioUrl: (url) => {
-    const s = useSessionStore.getState();
-    saveConfig(s.crwUrl, s.crwApiKey, url);
     set({ lmStudioUrl: url });
+    persistConfig();
+  },
+  setUnslothUrl: (url) => {
+    set({ unslothUrl: url });
+    persistConfig();
+  },
+  setUnslothApiKey: (key) => {
+    set({ unslothApiKey: key });
+    persistConfig();
   },
   setToolset: (t) => set({ toolset: t }),
+  setSearchProviderOrder: (o) => {
+    set({ searchProviderOrder: o });
+    persistConfig();
+  },
+  setDdgMinIntervalMs: (ms) => {
+    set({ ddgMinIntervalMs: ms });
+    persistConfig();
+  },
+  setSearchTimeoutMs: (ms) => {
+    set({ searchTimeoutMs: ms });
+    persistConfig();
+  },
+  setScrapeTimeoutMs: (ms) => {
+    set({ scrapeTimeoutMs: ms });
+    persistConfig();
+  },
+  setBuiltinSearchEngines: (engines) => {
+    set({ builtinSearchEngines: normalizeEngines(engines) });
+    persistConfig();
+  },
+  setRobotsRespect: (v) => {
+    set({ robotsRespect: v });
+    persistConfig();
+  },
+  setScrapeMinIntervalMs: (ms) => {
+    set({ scrapeMinIntervalMs: ms });
+    persistConfig();
+  },
+  setScrapeMaxConcurrent: (n) => {
+    // Clamp here too: loadInitialState clamps on reload, and an unclamped
+    // runtime value would silently change meaning after a reload.
+    set({ scrapeMaxConcurrent: Math.min(8, Math.max(1, Math.floor(n) || 1)) });
+    persistConfig();
+  },
+  setMaxPageBytes: (bytes) => {
+    set({ maxPageBytes: bytes });
+    persistConfig();
+  },
+  setAllowPrivateHosts: (v) => {
+    set({ allowPrivateHosts: v });
+    persistConfig();
+  },
+  setSearxngUrl: (url) => {
+    set({ searxngUrl: url });
+    persistConfig();
+  },
   // toolset is connection-level infrastructure (which MCP tools are
   // available from crw/mailbox), not per-session research state — it's
   // resolved once by an effect keyed on crwUrl and nothing else ever
@@ -359,7 +595,25 @@ export const useSessionStore = create<SessionState>((set) => ({
       orchestratorModel: state.orchestratorModel,
       subagentModel: state.subagentModel,
       toolset: state.toolset,
+      // The inference backend is connection-level too: switching between
+      // LM Studio and Unsloth must survive Cancel/New Research.
+      llmProvider: state.llmProvider,
       lmStudioUrl: state.lmStudioUrl,
+      unslothUrl: state.unslothUrl,
+      unslothApiKey: state.unslothApiKey,
+      // Search tuning is connection-level like toolset — a Cancel/New
+      // Research must not silently revert the user's provider/timeouts.
+      searchProviderOrder: state.searchProviderOrder,
+      searxngUrl: state.searxngUrl,
+      ddgMinIntervalMs: state.ddgMinIntervalMs,
+      searchTimeoutMs: state.searchTimeoutMs,
+      scrapeTimeoutMs: state.scrapeTimeoutMs,
+      builtinSearchEngines: state.builtinSearchEngines,
+      robotsRespect: state.robotsRespect,
+      scrapeMinIntervalMs: state.scrapeMinIntervalMs,
+      scrapeMaxConcurrent: state.scrapeMaxConcurrent,
+      maxPageBytes: state.maxPageBytes,
+      allowPrivateHosts: state.allowPrivateHosts,
     }));
   },
   loadSession: (entry) => set({
@@ -374,6 +628,12 @@ export const useSessionStore = create<SessionState>((set) => ({
     clarifyingMessages: entry.clarifyingMessages,
     clarifyingThoughts: entry.clarifyingThoughts,
     error: entry.error,
+    // Restore is a clean view of a FINISHED run: clear the "research was
+    // stopped" banner from any prior interrupted session, and drop the old
+    // backend response id so a later orchestrator turn can't reference a
+    // response from a different session via previous_response_id.
+    interrupted: false,
+    orchestratorResponseId: undefined,
   }),
 }));
 

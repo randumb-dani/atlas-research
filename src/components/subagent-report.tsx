@@ -45,7 +45,7 @@ export function SubagentReport({ report, hitIterationCap, scrollable, className 
             className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors px-1.5 py-0.5 rounded hover:bg-muted/50"
             aria-label={copied ? "Copied" : "Copy report"}
           >
-            {copied ? <Check className="size-3 text-green-500" /> : <Copy className="size-3" />}
+            {copied ? <Check className="size-3 text-success" /> : <Copy className="size-3" />}
             {copied ? "Copied" : "Copy"}
           </button>
         </div>

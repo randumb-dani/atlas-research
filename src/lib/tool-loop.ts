@@ -1,9 +1,11 @@
-import { mcpListTools, mcpCallTool, mcpResultToText, type McpToolDef } from "./mcp-client";
+import { type McpToolDef } from "./mcp-client";
 import { streamChatCompletion, type OpenAIMessage, type OpenAIToolDef } from "./openai-compat";
 import type { SSEEvent } from "./types";
 import { useSessionStore } from "./store";
-import { toOpenAITool, type ResolvedToolset, type ToolSource } from "./tool-types";
+import { toOpenAITool, toolArgQuery, toolArgUrl, type ResolvedToolset, type ToolSource } from "./tool-types";
+export { setToolTimeouts, getToolTimeouts, timeoutForTool } from "./tool-types";
 import { drainInbox } from "./mailbox-local";
+import { isAbortError, sleepJittered, StallTimeoutError } from "./fetch-timeout";
 
 /**
  * A tool the app itself can dispatch. `crw` tools are backed by a real MCP
@@ -15,42 +17,52 @@ import { drainInbox } from "./mailbox-local";
  */
 
 /**
- * SearXNG fans a single crw_search call out to EVERY enabled engine at once,
- * and those upstream engines (Brave, DuckDuckGo, KarmaSearch, Startpage,
- * Wikipedia, ...) CAPTCHA-wall or 429/403 under bursty concurrent load. Two
- * things stack to create that burst here: multiple subagents research in
- * parallel (Promise.all in research-chat.tsx), AND a single subagent's turn
- * can itself request several crw_search calls at once (see the
- * Promise.all(turnToolCalls.map(dispatchOne)) below, which intentionally
- * parallelizes all tool calls within one turn). So the real concurrency
- * hitting SearXNG is subagent-count × per-turn-search-count, not just
- * subagent count. SearXNG returns a throttled engine's failure as a
- * silently-empty result set rather than an error, so this doesn't look like
- * a crash — a throttled run just quietly comes back with nothing.
+ * Concurrency + rate gate for searches that reach crw/SearXNG.
  *
- * This limiter caps how many crw_search calls are in flight AT ONCE across
- * every subagent, turn, and cycle, module-level (matching how the mailbox
- * registry is scoped) so it holds regardless of how much parallelism is
- * requested above it. Extra calls queue and run in submission order once a
- * slot frees up, rather than failing or being dropped. crw_scrape is NOT
- * throttled here — unlike crw_search it isn't fanning out to a shared
- * rate-limited backend, so gating it would only slow research down for no
- * protective benefit.
+ * SearXNG fans a single search call out to EVERY enabled engine at once,
+ * and those upstream engines (Brave, DuckDuckGo, KarmaSearch, Startpage,
+ * Wikipedia, ...) CAPTCHA-wall or 429/403 under bursty concurrent load.
+ * Primary search traffic now goes to DuckDuckGo direct (paced inside
+ * ddg-search.ts), so this limiter only guards the crw-fallback path — but
+ * failovers correlate (when DDG throttles, every subagent fails over at
+ * once), which is exactly the burst shape SearXNG punishes. Kept tight.
  */
 const MAX_CONCURRENT_SEARCHES = 2;
+/** Minimum spacing, in ms, between the START of one crw-bound search call
+ * and the next -- independent of the concurrency cap above. 1500ms was
+ * chosen empirically as a starting point that keeps most SearXNG default
+ * engine sets under their burst thresholds; tune down if your instance can
+ * take it, up if you're still seeing 429s/CAPTCHAs.
+ */
+const MIN_SEARCH_INTERVAL_MS = 1500;
 let activeSearches = 0;
+let lastSearchStart = 0;
 const searchQueue: (() => void)[] = [];
 
 function acquireSearchSlot(): Promise<void> {
-  if (activeSearches < MAX_CONCURRENT_SEARCHES) {
-    activeSearches++;
-    return Promise.resolve();
-  }
   return new Promise((resolve) => {
-    searchQueue.push(() => {
-      activeSearches++;
-      resolve();
-    });
+    const tryStart = () => {
+      if (activeSearches >= MAX_CONCURRENT_SEARCHES) {
+        // No free concurrency slot -- queue and let releaseSearchSlot() retry.
+        searchQueue.push(tryStart);
+        return;
+      }
+      const now = Date.now();
+      const earliestStart = lastSearchStart + MIN_SEARCH_INTERVAL_MS;
+      if (now >= earliestStart) {
+        activeSearches++;
+        lastSearchStart = now;
+        resolve();
+      } else {
+        // A concurrency slot is free, but we're within the rate-limit
+        // window -- wait out the remainder, then attempt again. Another
+        // caller could grab the slot or advance lastSearchStart in the
+        // meantime, so we re-check from the top rather than assuming this
+        // wait was sufficient.
+        setTimeout(tryStart, earliestStart - now);
+      }
+    };
+    tryStart();
   });
 }
 
@@ -60,33 +72,18 @@ function releaseSearchSlot() {
   if (next) next();
 }
 
-async function throttledSearch<T>(fn: () => Promise<T>): Promise<T> {
+/**
+ * Runs `fn` through the shared crw/SearXNG pace gate. Used by the unified
+ * web_search source for its crw-fallback path — DDG-direct traffic paces
+ * itself inside ddg-search.ts instead.
+ */
+export async function throttledSearch<T>(fn: () => Promise<T>): Promise<T> {
   await acquireSearchSlot();
   try {
     return await fn();
   } finally {
     releaseSearchSlot();
   }
-}
-
-function mcpSource(label: string, serverUrl: string, apiKey?: string): ToolSource {
-  return {
-    label,
-    listTools: () => mcpListTools(serverUrl, apiKey),
-    callTool: async (name, args) => {
-      const call = async () => mcpResultToText(await mcpCallTool(serverUrl, name, args, apiKey));
-      // Only crw_search goes through the concurrency limiter -- see comment
-      // above. Everything else (crw_scrape, etc.) dispatches immediately.
-      if (name === "crw_search") {
-        return throttledSearch(call);
-      }
-      return call();
-    },
-  };
-}
-
-export function crwToolSource(crwUrl: string, apiKey?: string): ToolSource {
-  return mcpSource("crw", `${crwUrl}/mcp`, apiKey);
 }
 
 /** Fetches tool lists from every source and builds a combined dispatch table. Later sources win on name collisions. */
@@ -156,6 +153,18 @@ const MAX_TOOL_RESULT_CHARS = 6000;
 const OLD_RESULT_KEEP_RECENT = 3; // how many of the most recent tool results stay uncompacted
 const OLD_RESULT_COMPACT_CHARS = 800;
 
+/**
+ * A turn with no tool calls normally ends the loop — but weak tool-callers
+ * often open with preamble text ("Let me research…", "I'll start by…")
+ * instead of a call, which would end the run with zero evidence gathered.
+ * Nudge up to this many times before accepting a tool-less answer. Only
+ * applies while the agent has never called any tool; once it has, a
+ * tool-less turn is a legitimate finish.
+ */
+const MAX_NO_TOOL_NUDGES = 2;
+const NO_TOOL_NUDGE =
+  "[SYSTEM: You have not used any research tool yet. Do NOT write introductions, preambles, or statements of intent — your FIRST action must be a tool call (web_search with a query). Call it now.]";
+
 function capToolResult(text: string): string {
   if (text.length <= MAX_TOOL_RESULT_CHARS) return text;
   return text.slice(0, MAX_TOOL_RESULT_CHARS) + `\n\n[...truncated, ${text.length - MAX_TOOL_RESULT_CHARS} more characters omitted to stay within context budget...]`;
@@ -179,7 +188,125 @@ function compactOlderToolResults(messages: OpenAIMessage[]): void {
 }
 
 /**
- * Runs a full ReAct-style tool-calling loop against LM Studio's OpenAI-compat
+ * Self-hosted models frequently write tool calls as TEXT (a JSON block in
+ * the content stream) rather than emitting structured delta.tool_calls —
+ * LM Studio then returns them as plain content and a naive loop ends with
+ * zero evidence. These are the tools (and their required string args) the
+ * healer below recognizes. Strict on purpose: unknown names or missing args
+ * stay prose.
+ */
+const HEALABLE_TOOL_ARGS: Record<string, string[]> = {
+  web_search: ["query"],
+  crw_search: ["query"],
+  crw_scrape: ["url"],
+  send_to_subagent: ["to_subagent_key", "message"],
+  broadcast_to_peers: ["my_subagent_key", "message"],
+  check_inbox: ["my_subagent_key"],
+};
+
+/** Split top-level {...} objects out of text (strings-aware forward scan). */
+function splitJsonObjects(text: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === "}") {
+      if (depth > 0) {
+        depth--;
+        if (depth === 0 && start >= 0) {
+          out.push(text.slice(start, i + 1));
+          start = -1;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function asRecord(v: unknown): Record<string, unknown> | null {
+  if (typeof v === "object" && v !== null && !Array.isArray(v)) {
+    return v as Record<string, unknown>;
+  }
+  return null;
+}
+
+/**
+ * Recovers one tool call a template-based caller wrote as text — e.g.
+ * {"name": "web_search", "arguments": {"query": "..."}} — instead of
+ * emitting structured delta.tool_calls. Accepted shapes:
+ * {name, arguments}, {function: {name, arguments}}, and {name, ...args
+ * inline}. The arguments object must carry every required key as a
+ * non-empty string; anything else returns null and the prose stands.
+ */
+function healTextToolCall(
+  content: string,
+  iteration: number,
+): { id: string; name: string; arguments: Record<string, unknown> } | null {
+  if (!content || content.length > 8000) return null;
+  for (const candidate of splitJsonObjects(content)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+    const rec = asRecord(parsed);
+    if (!rec) continue;
+    const fn = asRecord(rec.function) ?? rec;
+    if (typeof fn.name !== "string") continue;
+    const normalized = fn.name.trim().toLowerCase();
+    const required = HEALABLE_TOOL_ARGS[normalized];
+    if (!required) continue;
+    let args: Record<string, unknown> | null;
+    if (typeof fn.arguments === "string") {
+      // Double-encoded arguments string — decode once.
+      try {
+        args = asRecord(JSON.parse(fn.arguments));
+      } catch {
+        continue;
+      }
+    } else {
+      args = asRecord(fn.arguments);
+    }
+    if (!args) {
+      // Inline-args shape: everything except the name/function keys.
+      args = {};
+      for (const [k, v] of Object.entries(rec)) {
+        if (k !== "name" && k !== "function" && k !== "arguments") args[k] = v;
+      }
+      const fnRec = asRecord(rec.function);
+      if (fnRec) {
+        for (const [k, v] of Object.entries(fnRec)) {
+          if (k !== "name" && k !== "arguments") args[k] = v;
+        }
+      }
+    }
+    const valid = required.every((k) => typeof args[k] === "string" && (args[k] as string).trim() !== "");
+    if (!valid) continue;
+    return { id: `call_healed_${iteration}`, name: normalized, arguments: args };
+  }
+  return null;
+}
+
+/**
+ * Runs a full ReAct-style tool-calling loop against an OpenAI-compatible
+ * backend (LM Studio, Unsloth Studio, llama-server…)
  * endpoint: stream a turn, dispatch any requested tool calls against the
  * app's own tool sources, feed results back as tool-role messages, repeat
  * until the model stops requesting tools (or maxIterations is hit).
@@ -200,9 +327,15 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<string> {
   // Track URLs that have already failed scraping — prevents the model
   // from retrying the same captcha/timeout/empty page over and over.
   const failedUrls = new Set<string>();
+  // Consecutive failures per normalized search query — after two strikes the
+  // model is told to reformulate instead of hammering a throttled provider.
+  const failedSearches = new Map<string, number>();
+  const MAX_SEARCH_FAILURES = 2;
 
   let finalContent = "";
   let hitIterationCap = false;
+  let sawToolCall = false;
+  let nudgeCount = 0;
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
     let turnContent = "";
@@ -242,27 +375,89 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<string> {
     }
 
     onEvent({ type: "message.start" });
-    const result = await streamChatCompletion(
-      {
-        model,
-        messages,
-        tools: isLastIteration ? undefined : (toolset.tools.length > 0 ? toolset.tools : undefined),
-        temperature,
-      },
-      {
-        onReasoningDelta: (c) => onEvent({ type: "reasoning.delta", content: c }),
-        onMessageDelta: (c) => {
-          turnContent += c;
-          onEvent({ type: "message.delta", content: c });
+    let result: Awaited<ReturnType<typeof streamChatCompletion>>;
+    try {
+      result = await streamChatCompletion(
+        {
+          model,
+          messages,
+          tools: isLastIteration ? undefined : (toolset.tools.length > 0 ? toolset.tools : undefined),
+          temperature,
         },
-        onError: (err) => onEvent({ type: "error", error: { type: "unknown", message: err.message } }),
-      },
-      signal,
-    );
+        {
+          onReasoningDelta: (c) => onEvent({ type: "reasoning.delta", content: c }),
+          onMessageDelta: (c) => {
+            turnContent += c;
+            onEvent({ type: "message.delta", content: c });
+          },
+          onError: (err) => onEvent({ type: "error", error: { type: "unknown", message: err.message } }),
+        },
+        signal,
+      );
+    } catch (err) {
+      // A failed turn (network blip, LM stall, timeout) used to kill the
+      // whole subagent with an empty report. Instead: close the open message
+      // block, log the failure visibly, tell the model what happened, and try
+      // the turn again — the loop budget still bounds total work. User Cancel
+      // (AbortError) is the only thing that propagates.
+      onEvent({ type: "message.end" });
+      if (signal?.aborted || isAbortError(err)) throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const type = err instanceof StallTimeoutError ? "stall" : "unknown";
+      console.warn(`[tool-loop] turn ${iteration} failed (${type}), retrying next iteration: ${msg}`);
+      onEvent({ type: "error", error: { type, message: `Turn failed (${msg}) — continuing with the next turn.` } });
+      messages.push({
+        role: "system",
+        content: `[SYSTEM: your last turn failed to generate (${msg}). Continue your research from where you left off — do not restart, do not apologize, just proceed with your next search, scrape, or report step.]`,
+      });
+      try {
+        await sleepJittered(2000, signal);
+      } catch {
+        throw signal?.reason instanceof Error ? signal.reason : new Error("Aborted");
+      }
+      continue;
+    }
     onEvent({ type: "message.end" });
     turnToolCalls.push(...result.toolCalls);
 
+    // Text-form recovery: template-based callers often write the call as a
+    // JSON block in the content stream instead of structured tool_calls
+    // (LM Studio then returns it as plain text). Heal it into a real call —
+    // but ONLY while the run has never made a structured call, so example
+    // JSON inside a later final report can never be mistaken for intent.
+    if (turnToolCalls.length === 0 && !sawToolCall) {
+      const healed = healTextToolCall(turnContent || result.content, iteration);
+      if (healed) {
+        console.log(`[tool-loop] healed text-form tool call: ${healed.name}(${JSON.stringify(healed.arguments).slice(0, 120)})`);
+        onEvent({ type: "tool_call.start", tool: healed.name, provider_info: { healed_from_text: true } });
+        onEvent({ type: "tool_call.arguments", tool: healed.name, arguments: healed.arguments });
+        turnToolCalls.push(healed);
+      }
+    }
+
+    if (turnToolCalls.length > 0) sawToolCall = true;
+
     if (turnToolCalls.length === 0) {
+      // No tool calls this turn. Normally a plain answer ends the loop —
+      // UNLESS the agent hasn't used any tool yet: that's the "Let me
+      // research…" preamble trap, which would end the run with zero
+      // evidence. Keep the preamble in the transcript (so the model doesn't
+      // repeat it), nudge once, and continue. Bounded so a genuinely
+      // tool-averse model still terminates.
+      if (!sawToolCall && nudgeCount < MAX_NO_TOOL_NUDGES && !isLastIteration) {
+        nudgeCount++;
+        messages.push({ role: "assistant", content: turnContent || result.content || null });
+        messages.push({ role: "system", content: NO_TOOL_NUDGE });
+        console.log(`[tool-loop] turn ${iteration} had no tool calls — nudge ${nudgeCount}/${MAX_NO_TOOL_NUDGES}`);
+        onEvent({
+          type: "error",
+          error: {
+            type: "no_tool_call",
+            message: `Turn produced no tool call (nudge ${nudgeCount}/${MAX_NO_TOOL_NUDGES}) — asking the model to search first instead of ending the run.`,
+          },
+        });
+        continue;
+      }
       // Plain answer — this is the end of the loop.
       finalContent = turnContent || result.content;
       break;
@@ -297,7 +492,45 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<string> {
       })),
     });
 
+    const isSearchTool = (name: string) => {
+      const n = name.trim().toLowerCase();
+      return n === "crw_search" || n === "web_search" || n === "web_fetch";
+    };
+
+    const isFetchTool = (name: string) => {
+      const n = name.trim().toLowerCase();
+      return n === "crw_scrape" || n === "web_fetch" || n === "web_search";
+    };
+
+    /** SearXNG-style throttling surfaces as silently-empty (or "no results")
+     * output rather than an error — detect it so we can back off + retry
+     * instead of letting the model build on nothing. */
+    const isEmptySearchResult = (text: string): boolean => {
+      const t = text.trim();
+      if (!t) return true;
+      return /no\s+results?\s+found/i.test(t.slice(0, 300));
+    };
+
+    const searchQueryOf = (call: { arguments: Record<string, unknown> }): string => {
+      return toolArgQuery(call.arguments).toLowerCase();
+    };
+
     const dispatchOne = async (call: { id: string; name: string; arguments: Record<string, unknown> }): Promise<string> => {
+      try {
+        return await dispatchInner(call);
+      } catch (err) {
+        // Absolute containment: no single tool call may ever reject the
+        // turn. Aborts propagate (user Cancel); everything else becomes a
+        // tool-role error message the model can react to.
+        if (signal?.aborted || isAbortError(err)) throw err;
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[tool-call] ${call.name} → UNCAUGHT: ${msg}`);
+        onEvent({ type: "tool_call.failure", reason: msg, metadata: { tool_name: call.name } });
+        return `[error] ${msg}`;
+      }
+    };
+
+    const dispatchInner = async (call: { id: string; name: string; arguments: Record<string, unknown> }): Promise<string> => {
       // LM Studio (and OpenAI-compat backends) occasionally emit tool names
       // with stray whitespace or casing differences, which would otherwise
       // miss the exact-map lookup and surface as a spurious "Unknown tool"
@@ -307,12 +540,10 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<string> {
       // every call.
       const normalizedName = call.name.trim().toLowerCase();
       const exactMatch = toolset.dispatch.get(call.name);
-      const source =
-        exactMatch ??
-        toolset.dispatch.get(normalizedName) ??
-        toolset.dispatchLower.has(normalizedName)
-          ? toolset.dispatch.get(toolset.dispatchLower.get(normalizedName)!)!
-          : undefined;
+      const viaLower = toolset.dispatchLower.has(normalizedName)
+        ? toolset.dispatch.get(toolset.dispatchLower.get(normalizedName)!)
+        : undefined;
+      const source = exactMatch ?? toolset.dispatch.get(normalizedName) ?? viaLower;
       // [LOG] tool-call attempt: name, source label if found, and whether it's registered.
       console.log(`[tool-call] ${call.name}(${JSON.stringify(call.arguments)}) → ${source ? `${source.label}` : 'unregistered'}`);
 
@@ -326,17 +557,77 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<string> {
         return errMsg;
       }
 
-      if (call.name === "crw_scrape") {
+      // Route by ARGUMENTS, not just name: the unified web_search tool does
+      // both jobs ({query} searches, {url} fetches). A URL wins when both
+      // are present — fetching is the concrete action.
+      const query = toolArgQuery(call.arguments);
+      const url = toolArgUrl(call.arguments);
+
+      // Query-bearing searches get retry-then-fail-fast (one retry with
+      // jittered backoff on failure/timeout/empty). Fetch-mode calls (URL
+      // present) fall through to the fetch path below.
+      if (query && isSearchTool(call.name) && !url) {
+        // Retry-then-fail-fast: one retry with jittered backoff on
+        // failure/timeout/empty (throttle signature), then a clear error
+        // telling the model to reformulate or move on. Repeated identical
+        // failures are gated so a throttled provider isn't hammered.
+        const key = searchQueryOf(call);
+        const failures = failedSearches.get(key) ?? 0;
+        if (failures >= MAX_SEARCH_FAILURES) {
+          const errMsg = `[error] This exact search already failed ${failures} times (provider throttling or no coverage). Do NOT retry it verbatim — reformulate the query with different terms, or move on to your next source.`;
+          console.log(`[tool-call] ${call.name}("${query}") → GATED (failed ${failures}x)`);
+          onEvent({ type: "tool_call.failure", reason: errMsg, metadata: { tool_name: call.name } });
+          return errMsg;
+        }
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (signal?.aborted) throw signal.reason ?? new Error("Aborted");
+          try {
+            const outputText = await source.callTool(call.name, call.arguments, { signal });
+            if (!isEmptySearchResult(outputText)) {
+              failedSearches.delete(key);
+              const preview = outputText.length > 200 ? `${outputText.substring(0, 200)}...` : outputText;
+              console.log(`[tool-call] ${call.name} → OK (${preview})`);
+              onEvent({ type: "tool_call.success", tool: call.name, arguments: call.arguments, output: outputText });
+              return outputText;
+            }
+            throw new Error("Search returned no usable results (provider may be throttling).");
+          } catch (err) {
+            if (signal?.aborted || isAbortError(err)) throw err;
+            const msg = err instanceof Error ? err.message : String(err);
+            const lastAttempt = attempt === 1;
+            console.log(`[tool-call] ${call.name} → attempt ${attempt + 1} FAILED: ${msg}`);
+            failedSearches.set(key, failures + attempt + 1);
+            if (!lastAttempt) {
+              onEvent({
+                type: "tool_call.failure",
+                reason: `Attempt ${attempt + 1} failed (${msg}) — backing off and retrying once.`,
+                metadata: { tool_name: call.name, attempt: attempt + 1, retrying: true },
+              });
+              await sleepJittered(2000, signal);
+              continue;
+            }
+            const errMsg = `[error] Search failed twice (${msg}). Reformulate with different terms, try a different angle, or move on — do not retry this exact query.`;
+            onEvent({ type: "tool_call.failure", reason: errMsg, metadata: { tool_name: call.name } });
+            return errMsg;
+          }
+        }
+        // Unreachable — the loop always returns or throws.
+        return "[error] Search failed unexpectedly.";
+      }
+
+      // Fetch path: explicit fetch names, plus web_search carrying a URL
+      // (the unified tool does both jobs — the URL decides).
+      if (url && (isFetchTool(call.name) || isSearchTool(call.name))) {
         // Gate: prevent re-scraping URLs that already failed (captcha/timeout/empty).
-        const urlArg = (call.arguments.url ?? call.arguments.Url ?? call.arguments.URL) as string | undefined;
-        if (urlArg && failedUrls.has(urlArg)) {
+        const urlArg: string = url;
+        if (failedUrls.has(urlArg)) {
           const errMsg = `[error] URL scrape failed previously (captcha/timeout/empty). Do not retry — move to next URL or summarize findings.`;
           console.log(`[tool-call] ${call.name}(${urlArg}) → GATED (already failed)`);
           onEvent({ type: "tool_call.failure", reason: errMsg, metadata: { tool_name: call.name, url: urlArg } });
           return errMsg;
         }
         try {
-          const outputText = await source.callTool(call.name, call.arguments);
+          const outputText = await source.callTool(call.name, call.arguments, { signal });
           if (subagentKey && urlArg) {
             const title = extractTitleFromMarkdown(outputText);
             const favicon = extractFaviconFromUrl(urlArg);
@@ -372,7 +663,7 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<string> {
       }
 
       try {
-        const outputText = await source.callTool(call.name, call.arguments);
+        const outputText = await source.callTool(call.name, call.arguments, { signal });
         const preview = outputText.length > 200 ? `${outputText.substring(0, 200)}...` : outputText;
         console.log(`[tool-call] ${call.name} → OK (${preview})`);
         onEvent({ type: "tool_call.success", tool: call.name, arguments: call.arguments, output: outputText });
@@ -385,7 +676,18 @@ export async function runToolLoop(opts: ToolLoopOptions): Promise<string> {
       }
     };
 
-    const outputs = await Promise.all(turnToolCalls.map(dispatchOne));
+    // allSettled: one rogue tool call must never take down its siblings'
+    // results. (dispatchOne already contains every error, so rejections here
+    // would only come from truly unexpected failures — still, never trust it.)
+    const settled = await Promise.allSettled(turnToolCalls.map(dispatchOne));
+    const outputs = settled.map((s, i) =>
+      s.status === "fulfilled" ? s.value : `[error] ${s.reason instanceof Error ? s.reason.message : String(s.reason)} (call ${turnToolCalls[i].name})`,
+    );
+    // User Cancel during tool dispatch: stop now rather than burning another
+    // (already-aborted) LLM turn.
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error ? signal.reason : new Error("Aborted");
+    }
     turnToolCalls.forEach((call, i) => {
       messages.push({ role: "tool", tool_call_id: call.id, content: capToolResult(outputs[i]) });
     });

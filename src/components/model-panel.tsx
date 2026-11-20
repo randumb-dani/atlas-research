@@ -10,6 +10,8 @@ import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Input } from "@/components/ui/input";
 import { listModels, loadModel, unloadModel } from "@/lib/api";
+import { LLM_PROVIDERS, normalizeLlmProvider } from "@/lib/llm-provider";
+import { useSessionStore } from "@/lib/store";
 import type { LMModel } from "@/lib/types";
 import { Search, RefreshCw, Cpu, Loader2, Zap, Box, ChevronDown } from "lucide-react";
 
@@ -67,8 +69,16 @@ function ModelPanelInline({ selectedModel, onSelectModel }: ModelPanelProps) {
 }
 
 function ModelPanelContent({ selectedModel, onSelectModel }: { selectedModel: string | null; onSelectModel: (model: string) => void }) {
+  const provider = useSessionStore((s) => normalizeLlmProvider(s.llmProvider));
+  const providerInfo = LLM_PROVIDERS[provider];
+  // LM Studio exposes load/unload + capability metadata. OpenAI-compatible
+  // backends (Unsloth Studio, llama-server…) own the model lifecycle and
+  // report neither, so the UI adapts instead of offering dead buttons.
+  const canManageModels = providerInfo.nativeApi;
+
   const [models, setModels] = useState<LMModel[]>([]);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [loadConfig, setLoadConfig] = useState({
     context_length: 16384,
@@ -79,19 +89,28 @@ function ModelPanelContent({ selectedModel, onSelectModel }: { selectedModel: st
 
   const fetch = useCallback(async () => {
     setLoading(true);
+    setError(null);
     try {
       const m = await listModels();
       setModels(m);
+    } catch (err) {
+      // An unreachable endpoint used to render as a bare "No models found",
+      // which reads like an empty library rather than a connection or 401
+      // problem — surface the real error instead.
+      setModels([]);
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
   }, []);
 
-  useEffect(() => { fetch(); }, [fetch]);
+  useEffect(() => { fetch(); }, [fetch, provider]);
 
   const filtered = models
     .filter((m) => m.type === "llm")
-    .filter((m) => !filterToolUse || m.capabilities?.trained_for_tool_use)
+    // Only LM Studio reports trained_for_tool_use; filtering OpenAI-compatible
+    // lists on it would hide every model.
+    .filter((m) => !filterToolUse || !canManageModels || m.capabilities?.trained_for_tool_use)
     .filter((m) =>
       !searchQuery ||
       m.display_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -143,6 +162,13 @@ function ModelPanelContent({ selectedModel, onSelectModel }: { selectedModel: st
         </Button>
       </div>
 
+      {error && (
+        <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <p className="font-medium">Couldn't reach {providerInfo.label}</p>
+          <p className="mt-0.5 break-words opacity-80">{error}</p>
+        </div>
+      )}
+
       <ScrollArea className="h-64">
         <div className="space-y-1 pr-2">
           {filtered.map((model) => {
@@ -162,6 +188,9 @@ function ModelPanelContent({ selectedModel, onSelectModel }: { selectedModel: st
                     {model.capabilities?.vision && (
                       <Badge variant="outline" className="text-[10px]">vision</Badge>
                     )}
+                    {model.loaded === false && (
+                      <Badge variant="outline" className="text-[10px] text-muted-foreground">not loaded</Badge>
+                    )}
                     {isCurrent && (
                       <Badge variant="success" size="sm">Selected</Badge>
                     )}
@@ -179,35 +208,46 @@ function ModelPanelContent({ selectedModel, onSelectModel }: { selectedModel: st
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
-                  <div className={`mr-1 size-1.5 rounded-full ${loaded ? "bg-green-500" : "bg-muted-foreground/40"}`} />
-                  {loaded ? (
-                    <>
-                      <Button variant="secondary" size="xs" onClick={() => onSelectModel(model.key)}>
-                        Use
+                  <div className={`mr-1 size-1.5 rounded-full ${loaded && model.loaded !== false ? "bg-green-500" : "bg-muted-foreground/40"}`} />
+                  {canManageModels ? (
+                    loaded ? (
+                      <>
+                        <Button variant="secondary" size="xs" onClick={() => onSelectModel(model.key)}>
+                          Use
+                        </Button>
+                        <Button variant="ghost" size="xs" onClick={() => unloadModel({ instance_id: model.loaded_instances[0].id }).then(fetch)}>
+                          Unload
+                        </Button>
+                      </>
+                    ) : (
+                      <Button variant="outline" size="xs" onClick={() => setLoadTarget(model)}>
+                        Load
                       </Button>
-                      <Button variant="ghost" size="xs" onClick={() => unloadModel({ instance_id: model.loaded_instances[0].id }).then(fetch)}>
-                        Unload
-                      </Button>
-                    </>
+                    )
                   ) : (
-                    <Button variant="outline" size="xs" onClick={() => setLoadTarget(model)}>
-                      Load
+                    <Button variant="secondary" size="xs" onClick={() => onSelectModel(model.key)}>
+                      Use
                     </Button>
                   )}
                 </div>
               </div>
             );
           })}
-          {filtered.length === 0 && (
-            <div className="flex h-24 flex-col items-center justify-center text-sm text-muted-foreground">
+          {filtered.length === 0 && !error && (
+            <div className="flex h-24 flex-col items-center justify-center px-4 text-center text-sm text-muted-foreground">
               <Box className="mb-2 size-6" />
               <p>No models found</p>
+              {!canManageModels && (
+                <p className="mt-1 text-[11px] leading-snug">
+                  Load a model in {providerInfo.label}, then press refresh.
+                </p>
+              )}
             </div>
           )}
         </div>
       </ScrollArea>
 
-      {loadTarget && (
+      {canManageModels && loadTarget && (
         <div className="rounded-xl border border-primary/20 bg-primary/[0.03] p-3 shadow-sm">
           <div className="mb-2 flex items-center gap-2">
             <Cpu className="size-4 text-primary" />

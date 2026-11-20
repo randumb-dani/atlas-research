@@ -21,7 +21,7 @@ import type { SSEEvent } from "./types";
  * so nothing is lost on reload.
  */
 const liveEvents = new Map<string, SSEEvent[]>();
-const MAX_LIVE_EVENTS = 4000;
+const generations = new Map<string, number>();
 
 export function pushLiveEvent(key: string, event: SSEEvent): void {
   let arr = liveEvents.get(key);
@@ -30,33 +30,43 @@ export function pushLiveEvent(key: string, event: SSEEvent): void {
     liveEvents.set(key, arr);
   }
   arr.push(event);
-  if (arr.length > MAX_LIVE_EVENTS) {
-    // Trim from the FRONT only as a memory backstop -- the live view renders
-    // the tail, so the most recent events are always preserved (unlike the
-    // old store behavior that cut the head and lost the start of the log).
-    arr.splice(0, arr.length - MAX_LIVE_EVENTS);
-  }
+  generations.set(key, (generations.get(key) ?? 0) + 1);
 }
 
 export function getLiveEvents(key: string): SSEEvent[] {
-  return liveEvents.get(key) ?? [];
+  const arr = liveEvents.get(key);
+  return arr ? [...arr] : [];
 }
 
-export function clearLiveEvents(key: string): void {
+export function getGeneration(key: string): number {
+  return generations.get(key) ?? 0;
+}
+
+/**
+ * Flush (clear) a single subagent's live event buffer. Call this when a
+ * subagent finishes its report — the in-memory buffer was only needed for the
+ * live streaming view, and once the agent is done the store's capped copy
+ * handles persistence and reload. Flushing early keeps memory bounded.
+ */
+export function flushLiveEvents(key: string): void {
   liveEvents.delete(key);
+  generations.delete(key);
 }
 
 /** Clear every agent's buffer (called on new research run / reset). */
 export function resetLiveEvents(): void {
   liveEvents.clear();
+  // Generations must be cleared too: a stale generation makes useLiveEvents
+  // believe an empty buffer is current and skip painting real events.
+  generations.clear();
 }
 
 /**
  * Reads a subagent's live event buffer into React state, but only commits a
- * re-render at most once per animation frame. This decouples the high-frequency
- * stream of `message.delta` events (potentially dozens per second) from React's
- * render cycle, so the event log paints smoothly even while the rest of the
- * store (subagents array, sources, etc.) is churning under crw/search latency.
+ * re-render when the buffer has actually grown (tracked via a generation
+ * counter). This avoids copying the entire buffer on every animation frame
+ * just to check if something changed — we do one cheap integer comparison per
+ * frame and only copy+setState when the generation advanced.
  *
  * Falls back to the store's persisted events when the live buffer is empty
  * (e.g. after a reload where the in-memory buffer was lost but the store still
@@ -66,34 +76,30 @@ export function useLiveEvents(key: string | null): SSEEvent[] {
   const [events, setEvents] = useState<SSEEvent[]>(() =>
     key ? getLiveEvents(key) : [],
   );
+  const genRef = useRef(0);
   const rafRef = useRef<number | null>(null);
   const keyRef = useRef<string | null>(key);
 
   useEffect(() => {
     keyRef.current = key;
-    // Immediately show whatever we already have for the new key.
-    setEvents(key ? getLiveEvents(key) : []);
+    if (key) {
+      genRef.current = getGeneration(key);
+      setEvents(getLiveEvents(key));
+    } else {
+      setEvents([]);
+    }
 
     let mounted = true;
-    const tick = () => {
-      rafRef.current = null;
-      if (!mounted) return;
-      const k = keyRef.current;
-      if (k) setEvents(getLiveEvents(k));
-    };
-    const schedule = () => {
-      if (rafRef.current == null) {
-        rafRef.current = requestAnimationFrame(tick);
-      }
-    };
-
-    // Poll on a rAF loop while a key is selected. This is cheaper than it
-    // sounds: rAF only fires when the tab is visible, and we read a reference
-    // (no copy) so the only cost is the occasional state commit when the
-    // buffer actually changed length.
     const loop = () => {
       if (!mounted) return;
-      schedule();
+      const k = keyRef.current;
+      if (k) {
+        const curGen = getGeneration(k);
+        if (curGen !== genRef.current) {
+          genRef.current = curGen;
+          setEvents(getLiveEvents(k));
+        }
+      }
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop);

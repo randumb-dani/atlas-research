@@ -24,6 +24,9 @@ export interface LMModel {
   description: string | null;
   variants?: string[];
   selected_variant?: string;
+  /** OpenAI-compatible backends only: explicit load state from /v1/models.
+   * undefined means the backend didn't report it (assume usable). */
+  loaded?: boolean;
 }
 
 export interface LoadedInstance {

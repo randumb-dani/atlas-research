@@ -13,15 +13,23 @@ import {
   CollapsiblePanel,
 } from "@/components/ui/collapsible";
 import { Streamdown } from "streamdown";
-import { streamChat } from "@/lib/api";
+import { streamChat, listModels } from "@/lib/api";
 import { useSessionStore, subagentKey } from "@/lib/store";
+import { LLM_PROVIDERS, normalizeLlmProvider } from "@/lib/llm-provider";
 import { useTheme } from "@/lib/theme-provider";
-import { resolveToolset, runToolLoop, crwToolSource } from "@/lib/tool-loop";
+import { resolveToolset, runToolLoop } from "@/lib/tool-loop";
+import { webSearchToolSource, resetCrwSessionFlag } from "@/lib/web-search-source";
+import { clearDdgCache, resetDdgThrottle } from "@/lib/ddg-search";
+import { clearSearxngCache, resetSearxngThrottle } from "@/lib/searxng";
+import { resetBuiltinSearch } from "@/lib/search-engines";
+import { resetScrapeState } from "@/lib/scraper";
+import { syncSearchRuntime } from "@/lib/apply-search-settings";
+import type { ResolvedToolset } from "@/lib/tool-types";
 import { loadHistory, addEntry, deleteEntry, clearHistory } from "@/lib/history";
 import type { HistoryEntry } from "@/lib/history";
 import { HistoryPanel } from "@/components/history-panel";
 import { mailboxToolSource, registerAgent as mailboxRegister, deregisterAgent as mailboxDeregister, resetMailbox, resetCycleAgents, collectUndelivered, drainInbox } from "@/lib/mailbox-local";
-import { pushLiveEvent, resetLiveEvents, useLiveEvents } from "@/lib/live-events";
+import { pushLiveEvent, resetLiveEvents, useLiveEvents, flushLiveEvents } from "@/lib/live-events";
 import { playSound, preloadSounds } from "@/lib/sounds";
 import { useIsMobile } from "@/hooks/use-is-mobile";
 import {
@@ -43,6 +51,11 @@ import {
   PanelRight,
   Settings,
   Download,
+  Copy,
+  Check,
+  ScanSearch,
+  Sparkles,
+  Activity,
 } from "lucide-react";
 import { SourcesSheet } from "@/components/sources-sheet";
 import { SubagentStatus } from "@/components/subagent-status";
@@ -112,8 +125,11 @@ interface ClarifyDecision {
  * list of question strings instead of one markdown block. */
 function normalizeQuestions(questions: string | string[] | null | undefined): string {
   if (!questions) return "";
-  const text = Array.isArray(questions) ? questions.join("\n\n") : questions;
-  return text.trim();
+  if (Array.isArray(questions)) {
+    const items = questions.map((q) => q.trim()).filter(Boolean);
+    return items.map((q, i) => `${i + 1}. ${q}`).join("\n");
+  }
+  return questions.trim();
 }
 
 interface GapCheckDecision {
@@ -129,12 +145,70 @@ interface PlanItem {
   focus_questions?: string[];
 }
 
+interface PeerInfo {
+  id: string;
+  key: string;
+  brief: string;
+  questions: string[];
+}
+
+/** System prompt for one research subagent. Module-level so both the cycle
+ * runner and single-agent retry build byte-identical prompts. */
+function buildSubagentPrompt(displayId: string, key: string, brief: string, peers: PeerInfo[]): string {
+  const peerBlock = peers.length === 0 ? "" :
+    "PEER SUBAGENTS IN THIS CYCLE:\n" +
+    peers.map((p) =>
+      `- ${p.id} (key: ${p.key}) — ${p.brief}${p.questions.length ? `\n  Focus questions: ${p.questions.join("; ")}` : ""}`
+    ).join("\n") + "\n\n";
+  return withDate(`You are research subagent "${displayId}" (internal key: ${key}). Task: ${brief}
+
+Available tools (call them — do not describe them, do not announce them):
+- web_search -- the ONLY research tool. Two modes: pass query (3-10 distinctive terms) to search the web (returns short Title/URL/Snippet blocks — use FIRST to find source URLs), or pass url (an exact URL from a prior search — never invent one) to fetch that page as Markdown text. If both are present, url wins. Ask for at most 5 results per search, and issue ONE search at a time -- rapid parallel searches get the provider to throttle you. Search results are snippets, not evidence: fetch a promising URL with a second call before drawing conclusions. Prefer fetching over more searching once you have a good URL.
+
+Your FIRST response must be a web_search call, not text. Do not write introductions, preambles, or statements of intent ("Let me research…", "I'll start by…") — just call web_search immediately.
+- send_to_subagent(to_subagent_key: string, message: string) -- Send a message to one specific peer by their internal key.
+- broadcast_to_peers(my_subagent_key: string, message: string) -- Send a message to ALL other peers at once. Use this whenever a finding is relevant to more than one peer, or when you're unsure which single agent should receive it -- it's easier and more reliable than guessing a key.
+- check_inbox(my_subagent_key: string) -- Check for messages from other subagents. Non-destructive: calling it doesn't consume anything, so unread messages will also still appear automatically at the start of your next turn -- you don't need to call it defensively "just in case," and seeing the same message twice (once from a check_inbox call, once auto-delivered) is expected, not a sign something is wrong.
+
+${peerBlock}COORDINATION -- all peers are researching IN PARALLEL, so the best time to share is DURING your research, not at the end:
+- Share findings THE MOMENT you find them: as soon as a scrape reveals something that answers a peer's focus question, contradicts their expected angle, or is a high-value source they'd want, send it. Don't wait until you write your report -- by then your peers are also busy writing their own reports and won't act on it.
+- Use broadcast_to_peers for anything relevant to the group or when you're unsure who needs it, or for help with tools if yours are failing. It reaches every other peer at once.
+- Use check_inbox periodically BETWEEN scrapes (not just at the end) to pick up findings peers have already sent you -- they're researching at the same time you are, so new messages arrive mid-research.
+- Alert on tool failures: if your scrapes keep hitting login/captcha walls or returning thin content, broadcast to peers so they know a gap exists.
+- Messaging is NEVER wasted: notes to still-active peers are delivered directly (they'll see them on their next turn), and notes to peers who have already finished are recorded and read by the orchestrator during final synthesis. Even a one-line pointer to a source or a contradiction is worth sending.
+- Do not spam -- consolidate related findings into a single message rather than many small ones.
+
+RESEARCH DISCIPLINE -- do not skip this:
+1. A search snippet is not a finding -- it's an address where a finding might live. Never write your report from search results alone; scrape before drawing any conclusion. Issue ONE search at a time (parallel searches get throttled), with a limit of 3-5 results each.
+2. Source floor: scrape at least 4-6 real sources before writing your report, unless your assigned angle is genuinely narrow enough that fewer distinct sources exist -- if so, say that explicitly in your report rather than silently stopping short.
+3. A scrape returning HTTP 200 is not automatically a real success. Membership/login walls, pure navigation pages, and thin listicles with little substantive content don't count toward your source floor even though the tool call "succeeded" -- recognize a thin scrape and get a real replacement source instead of counting it.
+4. If your assigned angle touches a contested, social, political, or normative question, deliberately include at least one source that critiques, disputes, or takes a differing view -- not just sources that agree with each other. Five sources that all lean the same direction is not diverse coverage.
+5. When sources disagree on a specific fact (price, spec, date, claim), name which source said what rather than picking one as consensus.
+6. Attribute claims to their source in your report ("X's review found..."; "critics on Y argue...") rather than stating contested claims in your own voice as settled fact.
+7. Stop searching once you've hit your source floor and covered your assigned angle -- do not keep searching for marginally better sources once you have enough, but do not stop short of the floor to save time either.
+8. Check your inbox for peer findings periodically throughout your research (not only at the end) and incorporate them as you go; also do a final check before writing your report. If a peer sent useful data, attribute it in your report ("Agent X found that...").
+
+SOURCE LOG -- maintain this as you go:
+Keep a running numbered list of every source you actually scraped: [S1] url -- one-line description of what it contained. Every factual claim in your report must be traceable to one of these numbers. If you cannot assign a number to a claim, you cannot include the claim.
+
+OUTPUT FORMAT -- your final report must include, in order:
+1. Source log: the numbered [S1], [S2]... list described above.
+2. Findings: your actual research content, with every claim tagged inline to its source number, e.g. "The device draws 12W under load [S3]." Where sources conflict, show both: "[S2] reports X while [S4] reports Y."
+3. Confidence flags: a short list of any claims that rest on only one source, are dated/possibly stale, or come from a source of uncertain reliability (e.g. forum post, unverified blog). Don't bury this in prose -- list it so the orchestrator can see it at a glance.
+4. Gaps: anything your focus questions asked for that you could not find after a genuine search effort. Name the specific unanswered question. A stated gap is a correct, useful output -- not a failure.
+
+HARD CONSTRAINTS:
+- If you cannot find information to answer a specific question, write "Not found: [question]" in the Gaps section. Do not fill the gap with a plausible-sounding guess.
+- Never invent a URL, source name, statistic, date, or quote. If you're reconstructing something from memory rather than reading it in a scrape this session, don't present it as a finding -- flag it as unverified or leave it out.
+- Every number, quote, or specific factual claim needs a source tag. If it doesn't have one, either find the source or cut the claim.`);
+}
+
 const phaseSteps = [
   { key: "clarifying", label: "Clarify", icon: Brain },
   { key: "planning", label: "Plan", icon: ListChecks },
   { key: "researching", label: "Research", icon: Search },
-  { key: "gap_check", label: "Review", icon: FileSearch },
-  { key: "compiling", label: "Compile", icon: FileSearch },
+  { key: "gap_check", label: "Review", icon: ScanSearch },
+  { key: "compiling", label: "Compile", icon: Sparkles },
   { key: "done", label: "Done", icon: CheckCircle2 },
 ] as const;
 
@@ -161,7 +235,7 @@ function PhaseIndicator({ currentPhase, className }: { currentPhase: string; cla
                   : "text-muted-foreground bg-muted"
               )}
             >
-              <Icon className="size-3" />
+              <Icon className={cn("size-3", isActive && "animate-pulse-soft")} />
               <span>{step.label}</span>
             </div>
           </div>
@@ -182,6 +256,7 @@ export function ResearchChat({ sourcesOpen: externalSourcesOpen, onSourcesOpenCh
   const [researchDepth, setResearchDepth] = useState<"shallow" | "standard" | "deep">("standard");
   const depthCycles = { shallow: 2, standard: 3, deep: 5 } as const;
   const thoughtScrollRef = useRef<HTMLDivElement>(null);
+  const queryInputRef = useRef<HTMLTextAreaElement>(null);
   const [userScrolledUp, setUserScrolledUp] = useState(false);
   const [selectedAgentKey, setSelectedAgentKey] = useState<string | null>(null);
   const [mobileView, setMobileView] = useState<"list" | "detail">("list");
@@ -191,15 +266,25 @@ export function ResearchChat({ sourcesOpen: externalSourcesOpen, onSourcesOpenCh
 
   const cancelRef = useRef<AbortController | null>(null);
   const restoringRef = useRef(false);
+  // Guards against double-click / Enter double-fire during handleStart's
+  // async pre-flight (toolset + model check), before phase leaves "idle".
+  const startingRef = useRef(false);
+  const [starting, setStarting] = useState(false);
+  // Snapshot of the query + depth at Start time. The history effect below
+  // fires on phase change (long after Start), when `input`/`researchDepth`
+  // state may already be stale — the ref keeps the saved entry accurate.
+  const startedQueryRef = useRef("");
+  const startedDepthRef = useRef<"shallow" | "standard" | "deep">("standard");
 
   const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     setHistoryEntries(loadHistory());
   }, []);
 
-useEffect(() => {
+  useEffect(() => {
     preloadSounds();
   }, []);
 
@@ -210,7 +295,11 @@ useEffect(() => {
   useEffect(() => {
     let cancelled = false;
     setToolsetError(null);
-    resolveToolset([crwToolSource(crwUrl, crwApiKey), mailboxToolSource()])
+    // Apply persisted search tuning (provider order, DDG pacing, timeouts)
+    // before resolving — module runtimes start at compiled defaults.
+    syncSearchRuntime();
+    resetCrwSessionFlag();
+    resolveToolset([webSearchToolSource(crwUrl, crwApiKey), mailboxToolSource()])
       .then((resolved) => {
         if (cancelled) return;
         useSessionStore.getState().setToolset(resolved);
@@ -234,6 +323,15 @@ useEffect(() => {
   }, []);
 
   const phase = useSessionStore((s) => s.phase);
+
+  // Keep the idle query textarea sized to its content (including the
+  // placeholder when empty) so it never shows an internal scrollbar at rest.
+  useEffect(() => {
+    const el = queryInputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [input, phase]);
   const cycle = useSessionStore((s) => s.cycle);
   const maxCycles = useSessionStore((s) => s.maxCycles);
   const plan = useSessionStore((s) => s.plan);
@@ -262,9 +360,9 @@ useEffect(() => {
     const s = useSessionStore.getState();
     addEntry({
       id: crypto.randomUUID(),
-      query: input,
+      query: startedQueryRef.current,
       timestamp: Date.now(),
-      depth: researchDepth,
+      depth: startedDepthRef.current,
       orchModel: s.orchestratorModel ?? "",
       subModel: s.subagentModel ?? "",
       cycle: s.cycle,
@@ -282,7 +380,7 @@ useEffect(() => {
   }, [phase]);
   const hasOrchModel = useSessionStore((s) => s.orchestratorModel);
   const hasSubModel = useSessionStore((s) => s.subagentModel);
-  const canStart = hasOrchModel && hasSubModel && input.trim() && phase === "idle";
+  const canStart = hasOrchModel && hasSubModel && input.trim() && phase === "idle" && !starting;
   const store = useSessionStore;
 
 const runClarifying = useCallback(async (userInput: string) => {
@@ -297,9 +395,9 @@ const runClarifying = useCallback(async (userInput: string) => {
 Respond with ONLY a single JSON object, no other text, no markdown fences:
 {
   "needs_clarification": boolean,
-  "questions": string | null
+  "questions": string[] | null
 }
-If needs_clarification is true, format questions as a numbered markdown list with a brief preamble sentence explaining what you need.`);
+If needs_clarification is true, each element of "questions" must be ONE self-contained plain-text question (no markdown, no embedded newlines, no numbering prefix -- the array index provides the ordering). Keep the array empty/null if no clarification is needed.`);
     streamChat(
       { model: s.orchestratorModel!, input: prompt, stream: true, temperature: 0 },
       (event) => {
@@ -330,20 +428,104 @@ If needs_clarification is true, format questions as a numbered markdown list wit
   }, [store]);
 
 const handleStart = useCallback(async () => {
+    // Phase stays "idle" through the awaits below, so without this guard a
+    // second click / Enter would launch a second overlapping research run.
+    if (startingRef.current) return;
+    startingRef.current = true;
+    setStarting(true);
+    try {
     const s = store.getState();
     const orchModel = s.orchestratorModel;
     const subModel = s.subagentModel;
     if (!orchModel || !subModel || !input.trim()) return;
-    const preservedToolset = s.toolset;
     s.reset();
     resetMailbox();
     resetLiveEvents();
+    clearDdgCache();
+    resetDdgThrottle();
+    clearSearxngCache();
+    resetSearxngThrottle();
+    resetBuiltinSearch();
+    resetScrapeState();
+    startedQueryRef.current = input;
+    startedDepthRef.current = researchDepth;
     cancelRef.current = new AbortController();
     store.getState().setOrchestratorModel(orchModel);
     store.getState().setSubagentModel(subModel);
     store.getState().setMaxCycles(depthCycles[researchDepth]);
-    if (preservedToolset) store.getState().setToolset(preservedToolset);
+
+    // Resolve the toolset FRESH every session, rather than relying on the
+    // mount-time useEffect that may have resolved before crw was ready or
+    // may never re-run after a Cancel+Start cycle. This ensures the
+    // web_search tool is always present in the dispatch map when subagents
+    // start. (DDG search needs no handshake, so this succeeds even when crw
+    // is down — crw is only used as automatic failover.)
+    syncSearchRuntime();
+    resetCrwSessionFlag();
+    try {
+      const s2 = store.getState();
+      const resolved = await resolveToolset([
+        webSearchToolSource(s2.crwUrl, s2.crwApiKey || undefined),
+        mailboxToolSource(),
+      ]);
+      store.getState().setToolset(resolved);
+
+      // Check that the unified web_search tool (not just mailbox tools) is
+      // actually present. resolveToolset can silently skip a source that
+      // threw — without web_search, subagents would get "Unknown tool" for
+      // every search/scrape.
+      const hasWebSearch = [...resolved.dispatch.entries()].some(
+        ([, src]) => src.label === "web",
+      );
+      if (!hasWebSearch) {
+        // Retry once with an extra delay — a transient import/init failure.
+        await new Promise((r) => setTimeout(r, 2000));
+        const retried = await resolveToolset([
+          webSearchToolSource(s2.crwUrl, s2.crwApiKey || undefined),
+          mailboxToolSource(),
+        ]);
+        store.getState().setToolset(retried);
+        const hasWebRetry = [...retried.dispatch.entries()].some(
+          ([, src]) => src.label === "web",
+        );
+        if (!hasWebRetry) {
+          store.getState().setError(
+            "Failed to initialize research tools. Reload the app and try again — if it persists, check your crw connection in Settings.",
+          );
+          return;
+        }
+      }
+    } catch (err) {
+      store.getState().setError(
+        err instanceof Error ? err.message : "Failed to load research tools.",
+      );
+      return;
+    }
+
+    // Quick sanity-check that the selected models actually exist in the
+    // configured backend before entering the clarifying stream.
+    try {
+      const models = await listModels();
+      const modelIds = models.map((m) => m.key);
+      const missing: string[] = [];
+      if (orchModel && !modelIds.includes(orchModel)) missing.push(orchModel);
+      if (subModel && !modelIds.includes(subModel)) missing.push(subModel);
+      if (missing.length > 0) {
+        const providerLabel = LLM_PROVIDERS[normalizeLlmProvider(store.getState().llmProvider)].label;
+        const errMsg = `The following model(s) are no longer available in ${providerLabel}:\n${missing.join(", ")}\n\nOpen Settings, refresh the model list, and select a valid model.`;
+        store.getState().setError(errMsg);
+        return;
+      }
+    } catch {
+      // listModels can fail if the backend is unreachable — let the clarifying
+      // stream surface the real error instead.
+    }
+
     runClarifying(input);
+    } finally {
+      startingRef.current = false;
+      setStarting(false);
+    }
   }, [input, store, runClarifying, researchDepth]);
 
   const handleCancel = useCallback(() => {
@@ -364,6 +546,11 @@ const handleStart = useCallback(async () => {
     resetLiveEvents();
     useSessionStore.getState().loadSession(entry);
     setInput(entry.query);
+    // Keep the "started" refs pointed at the restored run: a recompile or a
+    // history save after restore would otherwise label the result with the
+    // *previous* session's query/depth.
+    startedQueryRef.current = entry.query;
+    startedDepthRef.current = entry.depth;
     setSelectedAgentKey(null);
   }, []);
 
@@ -377,20 +564,65 @@ const handleStart = useCallback(async () => {
     setHistoryEntries([]);
   }, []);
 
+  /** Full export text: compiled report plus a generated Sources appendix so
+   * the downloaded/copied file stands alone (the UI's Sources sheet doesn't
+   * travel with a bare report). */
+  const buildReportExport = useCallback((): string => {
+    const s = store.getState();
+    const report = s.compiledReport;
+    const seen = new Set<string>();
+    const lines: string[] = [];
+    for (const agent of s.subagents) {
+      for (const src of agent.sources ?? []) {
+        if (src.status !== "success" || seen.has(src.url)) continue;
+        seen.add(src.url);
+        const label = src.title || src.url;
+        lines.push(`- [${label}](${src.url}) (via ${formatSubagentId(agent.id)})`);
+      }
+    }
+    if (lines.length === 0) return report;
+    return `${report}\n\n---\n\n## Sources\n\n${lines.join("\n")}\n`;
+  }, [store]);
+
+  const handleCopyReport = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(buildReportExport());
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      store.getState().setError("Copy failed — your browser blocked clipboard access.");
+    }
+  }, [buildReportExport, store]);
+
+  const handleDownloadReport = useCallback(() => {
+    const blob = new Blob([buildReportExport()], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `research-report-${new Date().toISOString().slice(0, 10)}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [buildReportExport]);
+
   const handleClarifyAnswer = useCallback(async () => {
     if (!clarifyingAnswer.trim()) return;
     const s = store.getState();
     const answer = clarifyingAnswer;
+    // Self-contained: the OpenAI-compatible provider ignores previous_response_id,
+    // so this prompt must carry the original query and the questions already asked.
     const prompt = withDate(`[ROLE] You are a deep research agent.
-[USER RESPONSE TO YOUR CLARIFYING QUESTION(S)] "${answer}"
+[ORIGINAL QUERY] "${input}"
+[YOUR CLARIFYING QUESTIONS AND THE CONVERSATION SO FAR]
+${s.clarifyingMessages || "(none yet)"}
+[LATEST USER RESPONSE] "${answer}"
 
-Decide if you now have enough to proceed, or need to ask more.
+Decide if you now have enough to research the original query, or need to ask more.
 Respond with ONLY a single JSON object, no other text, no markdown fences:
 {
   "needs_clarification": boolean,
-  "questions": string | null
+  "questions": string[] | null
 }
-If needs_clarification is true, format questions as a numbered markdown list with a brief preamble.`);
+Ask again ONLY if a specific missing detail would materially change the research plan. If needs_clarification is true, each element of "questions" must be ONE self-contained plain-text question (no markdown, no embedded newlines, no numbering prefix -- the array index provides the ordering). Keep the array empty/null if no clarification is needed.`);
     setClarifyingAnswer("");
     store.getState().setClarifyingThoughts("");
     useSessionStore.setState((state) => ({
@@ -467,6 +699,58 @@ Every brief must be derivable from the words in the actual query above -- if you
     );
   }, [store]);
 
+  const runOneSubagent = useCallback(async (
+    subModel: string,
+    toolset: ResolvedToolset,
+    agent: { id: string; key: string; brief: string },
+    peers: PeerInfo[],
+  ): Promise<string> => {
+    const { id, key, brief } = agent;
+    const sp = buildSubagentPrompt(id, key, brief, peers);
+    try {
+      let hitCap = false;
+      const text = await runToolLoop({
+        model: subModel,
+        systemPrompt: sp,
+        userInput: "Research and report findings.",
+        toolset,
+        temperature: 0,
+        maxIterations: 16,
+        subagentKey: key,
+        signal: cancelRef.current?.signal,
+        onEvent: (event) => {
+          if (event.type === "error" && event.error.type === "iteration_cap") hitCap = true;
+          pushLiveEvent(key, event);
+          store.getState().addSubagentEvent(key, event);
+        },
+      });
+      // Final drain: catch any peer messages that arrived after the tool
+      // loop's own late drain but before deregister.
+      const finalLate = drainInbox(key);
+      if (finalLate.length > 0) {
+        store.getState().addSubagentPeerMessages(key, finalLate);
+      }
+      store.getState().updateSubagent(key, { status: "done", report: text, hitIterationCap: hitCap, completedAt: Date.now() });
+      mailboxDeregister(key);
+      flushLiveEvents(key);
+      return text;
+    } catch (err) {
+      // Also drain on error path.
+      const errLate = drainInbox(key);
+      if (errLate.length > 0) {
+        store.getState().addSubagentPeerMessages(key, errLate);
+      }
+      store.getState().addSubagentEvent(key, {
+        type: "error" as const,
+        error: { type: "unknown", message: err instanceof Error ? err.message : String(err) },
+      });
+      store.getState().updateSubagent(key, { status: "done", report: "", completedAt: Date.now() });
+      mailboxDeregister(key);
+      flushLiveEvents(key);
+      return "";
+    }
+  }, [store]);
+
   const runResearchCycle = useCallback(async (model: string, query: string, cycleNum: number, priorReports: string[]) => {
     const s = store.getState();
     let currentToolset = useSessionStore.getState().toolset;
@@ -483,7 +767,10 @@ Every brief must be derivable from the words in the actual query above -- if you
       store.getState().setError(
         "No research tools are available -- check your crw connection in settings."
       );
+      return;
     }
+
+    const toolset = currentToolset;
 
 s.setPhase("researching");
     playSound("researching");
@@ -525,95 +812,26 @@ s.setPhase("researching");
       mailboxRegister(key);
     }
 
-    const results = await Promise.all(parsedPlan.map(async (item) => {
+    const results = await Promise.all(parsedPlan.map(async (item, i) => {
       const key = subagentKey(cycleNum, item.subagent_id);
-      const peers = allAgents.filter((a) => a.key !== key);
-      const peerBlock = peers.length === 0 ? "" :
-        "PEER SUBAGENTS IN THIS CYCLE:\n" +
-        peers.map((p) =>
-          `- ${p.id} (key: ${p.key}) — ${p.brief}${p.questions.length ? `\n  Focus questions: ${p.questions.join("; ")}` : ""}`
-        ).join("\n") + "\n\n";
-      const sp = withDate(`You are research subagent "${item.subagent_id}" (internal key: ${key}). Task: ${item.brief}
-
-Available tools:
-- crw_search(query: string, limit?: number, lang?: string, tbs?: string, sources?: string[], categories?: string[]) -- Search the web. Returns title, URL, snippet for each result. LIMIT OF 3-4 RESULTS, OR YOU WILL OVERLOAD THE SEARCH ENGINE.
-- crw_scrape(url: string, formats?: string[], onlyMainContent?: boolean) -- Scrape a URL. Returns markdown (default), HTML, or links.
-- send_to_subagent(to_subagent_key: string, message: string) -- Send a message to one specific peer by their internal key.
-- broadcast_to_peers(my_subagent_key: string, message: string) -- Send a message to ALL other peers at once. Use this whenever a finding is relevant to more than one peer, or when you're unsure which single agent should get it -- it's easier and more reliable than guessing a key.
-- check_inbox(my_subagent_key: string) -- Check for messages from other subagents. Non-destructive: calling it doesn't consume anything, so unread messages will also still appear automatically at the start of your next turn -- you don't need to call it defensively "just in case," and seeing the same message twice (once from a check_inbox call, once auto-delivered) is expected, not a sign something is wrong.
-
-${peerBlock}COORDINATION -- all peers are researching IN PARALLEL, so the best time to share is DURING your research, not at the end:
-- Share findings THE MOMENT you find them: as soon as a scrape reveals something that answers a peer's focus question, contradicts their expected angle, or is a high-value source they'd want, send it. Don't wait until you write your report -- by then your peers are also busy writing their own reports and won't act on it.
-- Use broadcast_to_peers for anything relevant to the group or when you're unsure who needs it, or for help with tools if yours are failing. It reaches every other peer at once.
-- Use check_inbox periodically BETWEEN scrapes (not just at the end) to pick up findings peers have already sent you -- they're researching at the same time you are, so new messages arrive mid-research.
-- Alert on tool failures: if your scrapes keep hitting login/captcha walls or returning thin content, broadcast to peers so they know a gap exists.
-- Messaging is NEVER wasted: notes to still-active peers are delivered directly (they'll see them on their next turn), and notes to peers who have already finished are recorded and read by the orchestrator during final synthesis. Even a one-line pointer to a source or a contradiction is worth sending.
-- Do not spam -- consolidate related findings into a single message rather than many small ones.
-
-RESEARCH DISCIPLINE -- do not skip this:
-1. A search snippet is not a finding -- it's an address where a finding might live. Never write your report from search results alone; scrape before drawing any conclusion. Only perform ONE search in parallel, with a limit of 3-4 results.
-2. Source floor: scrape at least 4-6 real sources before writing your report, unless your assigned angle is genuinely narrow enough that fewer distinct sources exist -- if so, say that explicitly in your report rather than silently stopping short.
-3. A scrape returning HTTP 200 is not automatically a real success. Membership/login walls, pure navigation pages, and thin listicles with little substantive content don't count toward your source floor even though the tool call "succeeded" -- recognize a thin scrape and get a real replacement source instead of counting it.
-4. If your assigned angle touches a contested, social, political, or normative question, deliberately include at least one source that critiques, disputes, or takes a differing view -- not just sources that agree with each other. Five sources that all lean the same direction is not diverse coverage.
-5. When sources disagree on a specific fact (price, spec, date, claim), name which source said what rather than picking one as consensus.
-6. Attribute claims to their source in your report ("X's review found..."; "critics on Y argue...") rather than stating contested claims in your own voice as settled fact.
-7. Stop searching once you've hit your source floor and covered your assigned angle -- do not keep searching for marginally better sources once you have enough, but do not stop short of the floor to save time either.
-8. Check your inbox for peer findings periodically throughout your research (not only at the end) and incorporate them as you go; also do a final check before writing your report. If a peer sent useful data, attribute it in your report ("Agent X found that...").
-
-SOURCE LOG -- maintain this as you go:
-Keep a running numbered list of every source you actually scraped: [S1] url -- one-line description of what it contained. Every factual claim in your report must be traceable to one of these numbers. If you cannot assign a number to a claim, you cannot include the claim.
-
-OUTPUT FORMAT -- your final report must include, in order:
-1. Source log: the numbered [S1], [S2]... list described above.
-2. Findings: your actual research content, with every claim tagged inline to its source number, e.g. "The device draws 12W under load [S3]." Where sources conflict, show both: "[S2] reports X while [S4] reports Y."
-3. Confidence flags: a short list of any claims that rest on only one source, are dated/possibly stale, or come from a source of uncertain reliability (e.g. forum post, unverified blog). Don't bury this in prose -- list it so the orchestrator can see it at a glance.
-4. Gaps: anything your focus questions asked for that you could not find after a genuine search effort. Name the specific unanswered question. A stated gap is a correct, useful output -- not a failure.
-
-HARD CONSTRAINTS:
-- If you cannot find information to answer a specific question, write "Not found: [question]" in the Gaps section. Do not fill the gap with a plausible-sounding guess.
-- Never invent a URL, source name, statistic, date, or quote. If you're reconstructing something from memory rather than reading it in a scrape this session, don't present it as a finding -- flag it as unverified or leave it out.
-- Every number, quote, or specific factual claim needs a source tag. If it doesn't have one, either find the source or cut the claim.`);
-      try {
-        let hitCap = false;
-        const text = await runToolLoop({
-          model: s.subagentModel!,
-          systemPrompt: sp,
-          userInput: "Research and report findings.",
-          toolset: currentToolset ?? { tools: [], dispatch: new Map(), dispatchLower: new Map() },
-          temperature: 0,
-          maxIterations: 16,
-          subagentKey: key,
-          signal: cancelRef.current?.signal,
-          onEvent: (event) => {
-            if (event.type === "error" && event.error.type === "iteration_cap") hitCap = true;
-            pushLiveEvent(key, event);
-            store.getState().addSubagentEvent(key, event);
-          },
-        });
-        // Final drain: catch any peer messages that arrived after the tool
-        // loop's own late drain but before deregister.
-        const finalLate = drainInbox(key);
-        if (finalLate.length > 0) {
-          store.getState().addSubagentPeerMessages(key, finalLate);
-        }
-        store.getState().updateSubagent(key, { status: "done", report: text, hitIterationCap: hitCap, completedAt: Date.now() });
-        mailboxDeregister(key);
-        return text;
-      } catch (err) {
-        // Also drain on error path.
-        const errLate = drainInbox(key);
-        if (errLate.length > 0) {
-          store.getState().addSubagentPeerMessages(key, errLate);
-        }
-        store.getState().addSubagentEvent(key, {
-          type: "error" as const,
-          error: { type: "unknown", message: err instanceof Error ? err.message : String(err) },
-        });
-        store.getState().updateSubagent(key, { status: "done", report: "", completedAt: Date.now() });
-        mailboxDeregister(key);
-        return "";
+      // Stagger subagent starts so N agents don't fire their first searches
+      // in the same instant — cycle-start bursts are what get providers to
+      // throttle. Later searches are paced by the tool loop itself.
+      if (i > 0 && cancelRef.current && !cancelRef.current.signal.aborted) {
+        await new Promise((r) => setTimeout(r, Math.min(i, 3) * 2000));
       }
+      if (cancelRef.current?.signal.aborted) return "";
+      const peers = allAgents.filter((a) => a.key !== key);
+      return runOneSubagent(
+        s.subagentModel!,
+        toolset,
+        { id: item.subagent_id, key, brief: item.brief },
+        peers,
+      );
     }));
+    // A Cancel during the cycle must stick: without this guard the code
+    // below would resurrect the run into gap-check after the user cancelled.
+    if (cancelRef.current?.signal.aborted) return;
     runGapCheck(model, query, cycleNum, [...priorReports, ...results], parsedPlan);
   }, [store]);
 
@@ -659,7 +877,7 @@ Otherwise, set "action" to "replan" only if the gaps are specific and reasonably
           store.getState().setError(
             "Gap-check didn't return a valid decision -- compiling with what we have rather than looping forever."
           );
-          compileResults(model, query, allReportsSoFar);
+          compileResults(model, query, allReportsSoFar, subagentPlan);
           return;
         }
         store.getState().setGapCheckNotes(
@@ -669,14 +887,14 @@ Otherwise, set "action" to "replan" only if the gaps are specific and reasonably
         if (decision.action === "replan" && cycleNum < maxCycles) {
           startPlanning(model, query, allReportsSoFar);
         } else {
-          compileResults(model, query, allReportsSoFar);
+          compileResults(model, query, allReportsSoFar, subagentPlan);
         }
       },
       cancelRef.current?.signal,
     );
   }, [store, startPlanning]);
 
-const compileResults = useCallback(async (model: string, query: string, reports: string[]) => {
+const compileResults = useCallback(async (model: string, query: string, reports: string[], subagentPlan?: PlanItem[]) => {
     const s = store.getState();
     s.setPhase("compiling");
     playSound("compiling");
@@ -684,7 +902,7 @@ const compileResults = useCallback(async (model: string, query: string, reports:
     const undelivered = collectUndelivered();
     const compilePrompt = withDate(`Original query: "${query}"
 Research findings:
-${reports.map((r, i) => `--- Agent ${i + 1} ---\n${r}`).join("\n\n")}
+${reports.map((r, i) => `--- ${subagentPlan?.[i]?.subagent_id || "Agent " + (i + 1)} ---\n${r}`).join("\n\n")}
 
 ${undelivered.length > 0 ? `\nPeer messages that never reached their destination subagent (include any relevant findings but note they were not incorporated by the intended recipient):\n${undelivered.join("\n---\n")}` : ""}
 
@@ -705,11 +923,74 @@ HARD CONSTRAINTS:
       (event) => {
         if (event.type === "message.delta") store.getState().setCompiledReport(store.getState().compiledReport + event.content);
       },
-      (err) => { store.getState().setError(err.message); },
+      (err) => { store.getState().setError(err.message); store.getState().setPhase("done"); playSound("done"); },
       () => { store.getState().setPhase("done"); playSound("done"); },
       cancelRef.current?.signal,
     );
   }, [store, setSelectedAgentKey]);
+
+  // Guards concurrent retries of the same agent (double-clicks, list+detail).
+  const retryingRef = useRef<Set<string>>(new Set());
+
+  const handleRetrySubagent = useCallback(async (agentKey: string) => {
+    const s = store.getState();
+    const agent = s.subagents.find((a) => a.key === agentKey);
+    if (!agent || agent.status !== "done") return;
+    if (retryingRef.current.has(agentKey)) return;
+    const subModel = s.subagentModel;
+    const toolset = s.toolset;
+    if (!subModel || !toolset || toolset.tools.length === 0) {
+      s.setError("Can't retry: no subagent model or research tools available.");
+      return;
+    }
+    retryingRef.current.add(agentKey);
+    try {
+      // A fresh AbortController when the previous run already ended (its
+      // signal may be aborted); reuse the live one mid-run so Cancel still
+      // cancels the retry.
+      if (!cancelRef.current || cancelRef.current.signal.aborted) {
+        cancelRef.current = new AbortController();
+      }
+      mailboxRegister(agentKey);
+      s.updateSubagent(agentKey, {
+        status: "researching",
+        report: undefined,
+        hitIterationCap: undefined,
+        startedAt: Date.now(),
+        completedAt: undefined,
+      });
+      const peers: PeerInfo[] = s.subagents
+        .filter((a) => a.cycle === agent.cycle && a.key !== agentKey)
+        .map((a) => ({ id: a.id, key: a.key, brief: a.brief, questions: [] }));
+      const wasDonePhase = s.phase === "done";
+      if (wasDonePhase) {
+        // Re-entering research from a finished run: show the active view.
+        s.setPhase("researching");
+        s.setCompiledReport("");
+      }
+      const text = await runOneSubagent(
+        subModel,
+        toolset,
+        { id: agent.id, key: agentKey, brief: agent.brief },
+        peers,
+      );
+      // If the retried agent salvaged a report after the run had already
+      // compiled, recompile so the final report isn't stale. (Empty retry →
+      // leave the old compiled report alone.)
+      if (wasDonePhase && text && !cancelRef.current?.signal.aborted) {
+        const after = useSessionStore.getState();
+        const orchModel = after.orchestratorModel;
+        if (orchModel) {
+          const reports = after.subagents.map((a) => a.report ?? "");
+          compileResults(orchModel, startedQueryRef.current || "research", reports);
+        } else {
+          after.setPhase("done");
+        }
+      }
+    } finally {
+      retryingRef.current.delete(agentKey);
+    }
+  }, [store, runOneSubagent, compileResults]);
 
   const totalSources = subagents.reduce((n, a) => n + (a.sources?.length || 0), 0);
   const isMobile = useIsMobile();
@@ -753,14 +1034,16 @@ HARD CONSTRAINTS:
               </h1>
             </div>
 
-            {/* Input bar - chat style */}
+            {/* Input composer — single cohesive card: textarea on top, depth
+                selector and send in a footer row. */}
             <div className="animate-slide-up" style={{ animationDelay: "80ms" }}>
-              <div className="flex items-center gap-2 rounded-2xl border border-border/60 bg-card shadow-elev-1 px-4 py-2 focus-within:border-primary/40 focus-within:shadow-elev-2 transition-all">
+              <div className="rounded-2xl border border-border/60 bg-card shadow-elev-1 transition-all focus-within:border-primary/40 focus-within:shadow-elev-2">
                 <Textarea
-                  placeholder="e.g. latest advancements in fusion energy"
+                  ref={queryInputRef}
+                  placeholder="What are you curious about?"
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
-                  className="min-h-[48px] max-h-[40vh] resize-none border-0 bg-transparent px-3 py-3 shadow-none focus-visible:ring-0 text-sm leading-relaxed"
+                  className="min-h-[52px] max-h-[40vh] resize-none border-0 bg-transparent px-4 pt-3.5 pb-2 shadow-none focus-visible:ring-0 text-sm leading-relaxed"
                   aria-label="Research query"
                   rows={1}
                   onKeyDown={(e) => {
@@ -772,36 +1055,82 @@ HARD CONSTRAINTS:
                   onInput={(e) => {
                     const el = e.currentTarget;
                     el.style.height = "auto";
-                    el.style.height = el.scrollHeight + "px";
+                    el.style.height = `${el.scrollHeight}px`;
                   }}
                 />
-                {/* Depth pill */}
-                <button
-                  onClick={() => setResearchDepth(researchDepth === "shallow" ? "standard" : researchDepth === "standard" ? "deep" : "shallow")}
-                  className={cn(
-                    "flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-medium shrink-0 transition-colors",
-                    "border border-border/50 hover:bg-muted/50 text-muted-foreground"
-                  )}
-                  aria-label="Research depth"
-                >
-                  {researchDepth === "shallow" ? "Shallow" : researchDepth === "standard" ? "Standard" : "Deep"}
-                </button>
-                {/* Send button */}
-                <button
-                  onClick={handleStart}
-                  disabled={!canStart}
-                  className={cn(
-                    "flex size-9 items-center justify-center rounded-xl shrink-0 transition-all",
-                    canStart
-                      ? "bg-primary text-primary-foreground hover:opacity-90 active:scale-95"
-                      : "bg-muted text-muted-foreground/40 cursor-not-allowed"
-                  )}
-                  aria-label="Start research"
-                >
-                  <ArrowRight className="size-4" />
-                </button>
+                <div className="flex items-center justify-between gap-3 border-t border-border/40 px-3 py-2">
+                  <div className="flex items-center rounded-lg border border-border/40 bg-muted/30 p-0.5" role="radiogroup" aria-label="Research depth">
+                    {([
+                      { key: "shallow", label: "Shallow", hint: "Quick pass — 2 cycles" },
+                      { key: "standard", label: "Standard", hint: "Balanced — 3 cycles" },
+                      { key: "deep", label: "Deep", hint: "Thorough — 5 cycles" },
+                    ] as const).map((d) => {
+                      const active = researchDepth === d.key;
+                      return (
+                        <button
+                          key={d.key}
+                          type="button"
+                          role="radio"
+                          aria-checked={active}
+                          title={d.hint}
+                          onClick={() => setResearchDepth(d.key)}
+                          className={cn(
+                            "flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[11px] font-medium transition-all",
+                            active
+                              ? "bg-background text-foreground shadow-sm"
+                              : "text-muted-foreground hover:text-foreground",
+                          )}
+                        >
+                          <span
+                            className={cn(
+                              "size-1.5 rounded-full",
+                              d.key === "shallow" ? "bg-depth-shallow" : d.key === "standard" ? "bg-depth-standard" : "bg-depth-deep",
+                              !active && "opacity-40",
+                            )}
+                          />
+                          {d.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <button
+                    onClick={handleStart}
+                    disabled={!canStart}
+                    className={cn(
+                      "flex size-8 items-center justify-center rounded-lg shrink-0 transition-all",
+                      canStart
+                        ? "bg-primary text-primary-foreground hover:opacity-90 active:scale-95"
+                        : "bg-muted text-muted-foreground/40 cursor-not-allowed"
+                    )}
+                    aria-label={starting ? "Starting research" : "Start research"}
+                    title={starting ? "Starting research…" : "Start research"}
+                  >
+                    {starting ? <LoadingStandard size={12} /> : <ArrowRight className="size-4" />}
+                  </button>
+                </div>
               </div>
             </div>
+
+            {/* Example queries — populate the input on click so the empty
+                state teaches what a good query looks like. */}
+            {!input.trim() && (
+              <div className="flex flex-wrap items-center justify-center gap-2 animate-slide-up" style={{ animationDelay: "100ms" }}>
+                {[
+                  "How do modern fusion reactors actually work?",
+                  "What's holding solid-state batteries back?",
+                  "Compare local-first sync engines for apps",
+                ].map((ex) => (
+                  <button
+                    key={ex}
+                    type="button"
+                    onClick={() => setInput(ex)}
+                    className="rounded-full border border-border/50 bg-card/60 px-3 py-1.5 text-xs text-muted-foreground transition-all hover:border-primary/40 hover:text-foreground hover:bg-muted/40 active:scale-95"
+                  >
+                    {ex}
+                  </button>
+                ))}
+              </div>
+            )}
 
             {/* Prerequisites chips */}
             <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 animate-slide-up" style={{ animationDelay: "120ms" }}>
@@ -809,31 +1138,57 @@ HARD CONSTRAINTS:
                 { id: "orchestrator", done: !!hasOrchModel, label: "Orchestrator" },
                 { id: "subagent", done: !!hasSubModel, label: "Subagent" },
                 { id: "query", done: input.trim().length > 0, label: "Query" },
-              ].map((step) => (
-                <div key={step.id} className={cn(
-                  "flex items-center gap-1.5 text-xs transition-colors",
-                  step.done ? "text-foreground/70" : "text-muted-foreground/40"
-                )}>
-                  <CheckCircle2 className={cn(
-                    "size-3",
-                    step.done ? "text-primary" : "text-muted-foreground/30"
-                  )} />
-                  {step.label}
-                </div>
-              ))}
+              ].map((step) => {
+                // Unmet model prerequisites open Settings on click — the chip
+                // tells you what's missing AND leads you to the fix.
+                const openable = !step.done && step.id !== "query" && !!onSettingsClick;
+                return (
+                  <button
+                    key={step.id}
+                    type="button"
+                    disabled={!openable}
+                    onClick={openable ? onSettingsClick : undefined}
+                    title={openable ? "Open Settings to select this model" : undefined}
+                    className={cn(
+                      "flex items-center gap-1.5 text-xs transition-colors",
+                      step.done ? "text-foreground/70" : "text-muted-foreground/60",
+                      openable && "cursor-pointer text-warning/80 underline-offset-2 hover:underline hover:text-warning"
+                    )}
+                  >
+                    <CheckCircle2 className={cn(
+                      "size-3",
+                      step.done ? "text-success" : "text-warning/70"
+                    )} />
+                    {step.label}
+                  </button>
+                );
+              })}
             </div>
 
             {/* Warnings */}
             {(!hasOrchModel || !hasSubModel) && (
-              <div className="flex items-center gap-1.5 justify-center text-xs text-muted-foreground/60 animate-slide-up" style={{ animationDelay: "140ms" }}>
+              <button
+                type="button"
+                onClick={onSettingsClick}
+                className="mx-auto flex items-center gap-1.5 text-xs text-warning/80 underline-offset-2 transition-colors hover:text-warning hover:underline animate-slide-up"
+                style={{ animationDelay: "140ms" }}
+              >
                 <Brain className="size-3" />
                 Select models in Settings to begin
-              </div>
+              </button>
             )}
             {hasOrchModel && hasSubModel && toolsetError && (
               <div className="flex items-center gap-1.5 justify-center text-xs text-warning/80 animate-slide-up" style={{ animationDelay: "140ms" }}>
                 <AlertTriangle className="size-3" />
                 {toolsetError}
+              </div>
+            )}
+            {error && (
+              <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-xs text-destructive animate-slide-up" style={{ animationDelay: "140ms" }}>
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="size-3.5 shrink-0 mt-0.5" />
+                  <span className="whitespace-pre-wrap">{error}</span>
+                </div>
               </div>
             )}
           </div>
@@ -980,22 +1335,20 @@ HARD CONSTRAINTS:
               </Button>
             )}
             {compiledReport && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  const blob = new Blob([compiledReport], { type: "text/markdown;charset=utf-8" });
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement("a");
-                  a.href = url;
-                  a.download = `research-report-${new Date().toISOString().slice(0, 10)}.md`;
-                  a.click();
-                  URL.revokeObjectURL(url);
-                }}
-              >
-                <Download className="size-3" />
-                <span className="hidden sm:inline">Save Report</span>
-              </Button>
+              <>
+                <Button variant="outline" size="sm" onClick={handleCopyReport}>
+                  {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
+                  <span className="hidden sm:inline">{copied ? "Copied" : "Copy"}</span>
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleDownloadReport}
+                >
+                  <Download className="size-3" />
+                  <span className="hidden sm:inline">Save Report</span>
+                </Button>
+              </>
             )}
             <Button variant="outline" size="sm" onClick={() => { useSessionStore.getState().reset(); setInput(""); }}>
               <RotateCcw className="size-3" />
@@ -1062,7 +1415,7 @@ HARD CONSTRAINTS:
           >
             <Globe className="size-3" />
             <span className="hidden sm:inline">Sources</span>
-            <span className="inline sm:hidden">({totalSources})</span>
+            <span className="font-medium text-foreground tabular-nums">{totalSources}</span>
           </Button>
         </div>
         <div className="flex items-center gap-2 shrink-0">
@@ -1111,6 +1464,7 @@ HARD CONSTRAINTS:
             setSelectedAgentKey={setSelectedAgentKey}
             mobileView={mobileView}
             setMobileView={setMobileView}
+            onRetrySubagent={handleRetrySubagent}
           />
         </div>
       )}
@@ -1131,6 +1485,7 @@ HARD CONSTRAINTS:
             setSelectedAgentKey={setSelectedAgentKey}
             mobileView={mobileView}
             setMobileView={setMobileView}
+            onRetrySubagent={handleRetrySubagent}
           />
         </div>
       )}
@@ -1151,6 +1506,7 @@ HARD CONSTRAINTS:
               setSelectedAgentKey={setSelectedAgentKey}
               mobileView={mobileView}
               setMobileView={setMobileView}
+              onRetrySubagent={handleRetrySubagent}
             />
           </div>
 
@@ -1171,6 +1527,7 @@ HARD CONSTRAINTS:
               setSelectedAgentKey={setSelectedAgentKey}
               mobileView={mobileView}
               setMobileView={setMobileView}
+              onRetrySubagent={handleRetrySubagent}
             />
           </div>
         </div>
@@ -1197,16 +1554,16 @@ interface ResearchListViewProps {
   setSelectedAgentKey: (key: string | null) => void;
   mobileView: "list" | "detail";
   setMobileView: (view: "list" | "detail") => void;
+  onRetrySubagent: (key: string) => void;
 }
 
 function PlanView({ text }: { text: string }) {
+  // Use the robust envelope extractor (same one runResearchCycle uses) rather
+  // than raw JSON.parse, because the model often wraps the JSON in preamble
+  // prose ("Here is my plan:\n[...]") that pure JSON.parse can't handle.
   const items = useMemo(() => {
-    let parsed: any;
-    try {
-      parsed = JSON.parse(text);
-      if (Array.isArray(parsed)) return parsed;
-    } catch {}
-    return null;
+    const parsed = parseJsonEnvelope<{ subagent_id: string; brief: string; focus_questions?: string[] }[]>(text, true);
+    return Array.isArray(parsed) ? parsed : null;
   }, [text]);
 
   if (!items) {
@@ -1242,6 +1599,7 @@ function ResearchListView({
   setSelectedAgentKey,
   mobileView,
   setMobileView,
+  onRetrySubagent,
 }: ResearchListViewProps) {
   return (
     <div className="flex flex-col gap-3 h-full min-h-0">
@@ -1295,6 +1653,7 @@ function ResearchListView({
                       setSelectedAgentKey(selectedAgentKey === agent.key ? null : agent.key);
                       if (mobileView === "list") setMobileView("detail");
                     }}
+                    onRetry={onRetrySubagent}
                     style={{ animationDelay: `${idx * 60}ms` }}
                   />
                 ))
@@ -1327,10 +1686,11 @@ interface SubagentListItemProps {
   agentKey: string;
   isSelected: boolean;
   onSelect: () => void;
+  onRetry: (key: string) => void;
   style?: React.CSSProperties;
 }
 
-function SubagentListItem({ agentKey, isSelected, onSelect, style }: SubagentListItemProps) {
+function SubagentListItem({ agentKey, isSelected, onSelect, onRetry, style }: SubagentListItemProps) {
   const agent = useSessionStore((s) => s.subagents.find((a) => a.key === agentKey));
 
   if (!agent) return null;
@@ -1352,7 +1712,11 @@ function SubagentListItem({ agentKey, isSelected, onSelect, style }: SubagentLis
       <div className={cn("flex items-center gap-3 px-4 py-3 border-b border-border/40", isSelected ? "bg-primary/5" : "hover:bg-muted/50")}>
         <SubagentStatus agent={agent} />
         <div className="shrink-0">
-          <ResearchingSwirl size={20} done={agent.status === "done"} />
+          {agent.status === "pending" ? (
+            <span className="block size-5 rounded-full bg-muted-foreground/20" aria-hidden />
+          ) : (
+            <ResearchingSwirl size={20} done={agent.status === "done"} />
+          )}
         </div>
         <ChevronRight className={cn("size-4 text-muted-foreground transition-transform", isSelected && "rotate-90")} />
       </div>
@@ -1369,12 +1733,22 @@ function SubagentListItem({ agentKey, isSelected, onSelect, style }: SubagentLis
             <SubagentReport report={agent.report} hitIterationCap={agent.hitIterationCap} scrollable />
           )}
 
-          {agent.status === "done" && !agent.report && (
-            <div className="border-t border-border/30 pt-3">
-              <div className="flex items-center gap-2 text-xs font-medium text-destructive/80">
-                <AlertTriangle className="size-3" />
-                This subagent finished without producing a report -- check the event log above for errors.
-              </div>
+          {agent.status === "done" && (
+            <div className="border-t border-border/30 pt-3 flex items-center gap-2">
+              <button
+                onClick={(e) => { e.stopPropagation(); onRetry(agent.key); }}
+                className="flex items-center gap-1.5 rounded-lg border border-border/60 px-2.5 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                aria-label={`Retry ${agent.id}`}
+              >
+                <RotateCcw className="size-3" />
+                {agent.report ? "Retry agent" : "Retry (no report)"}
+              </button>
+              {agent.status === "done" && !agent.report && (
+                <span className="flex items-center gap-1.5 text-[11px] text-destructive/80">
+                  <AlertTriangle className="size-3" />
+                  Finished without a report
+                </span>
+              )}
             </div>
           )}
         </div>
@@ -1401,6 +1775,7 @@ interface ResearchDetailViewProps {
   setSelectedAgentKey: (key: string | null) => void;
   mobileView: "list" | "detail";
   setMobileView: (view: "list" | "detail") => void;
+  onRetrySubagent: (key: string) => void;
 }
 
 function ResearchDetailView({
@@ -1416,6 +1791,7 @@ function ResearchDetailView({
   setSelectedAgentKey: _setSelectedAgentKey,
   mobileView: _mobileView,
   setMobileView: _setMobileView,
+  onRetrySubagent,
 }: ResearchDetailViewProps) {
   const isCompiling = phase === "compiling";
   const detailScrollRef = useRef<HTMLDivElement>(null);
@@ -1498,24 +1874,27 @@ function ResearchDetailView({
       <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
         <div className="flex-1 min-h-0 rounded-xl border border-border/20 p-3.5 flex flex-col">
           <div className="flex items-center gap-2 pb-3 text-xs font-medium text-muted-foreground/70 uppercase tracking-wider">
-            <FileSearch className="size-3.5" />
-            Compiled Report
+            <Activity className="size-3.5 animate-pulse-soft" />
+            In progress
           </div>
           <div className="flex-1 flex items-center justify-center">
-            <div className="flex flex-col items-center gap-4 text-sm text-muted-foreground">
+            <div className="flex flex-col items-center gap-3 text-sm text-muted-foreground">
             {phase === "researching" ? (
               <ResearchingSwirl />
             ) : (
               <LoadingStandard size={16} />
             )}
-            <div className="w-20">
-              <p className="text-center">
-                {phase === "researching" ? "Researching…"
-                 : phase === "gap_check" ? "Reviewing findings for gaps…"
-                 : phase === "planning" ? "Generating research plan…"
-                 : "Preparing…"}
+            <p className="text-center max-w-[18rem]">
+              {phase === "researching" ? "Subagents are researching…"
+               : phase === "gap_check" ? "Reviewing findings for gaps…"
+               : phase === "planning" ? "Generating research plan…"
+               : "Preparing…"}
+            </p>
+            {(phase === "researching" || phase === "gap_check") && (
+              <p className="text-center text-xs text-muted-foreground/60">
+                Select a subagent on the left to watch its research live.
               </p>
-            </div>
+            )}
           </div>
           </div>
         </div>
@@ -1537,6 +1916,16 @@ function ResearchDetailView({
           <span className="ml-auto flex items-center gap-2 text-xs text-muted-foreground normal-case tracking-normal">
             {elapsedMs != null && <span title="Time spent researching">{formatDuration(elapsedMs)}</span>}
             <span>Cycle {selectedAgent.cycle}</span>
+            {selectedAgent.status === "done" && (
+              <button
+                onClick={() => onRetrySubagent(selectedAgent.key)}
+                className="flex items-center gap-1 rounded-md border border-border/60 px-2 py-1 text-[11px] font-medium hover:bg-muted/50 hover:text-foreground transition-colors"
+                aria-label={`Retry ${selectedAgent.id}`}
+              >
+                <RotateCcw className="size-3" />
+                Retry
+              </button>
+            )}
           </span>
         )}
       </div>

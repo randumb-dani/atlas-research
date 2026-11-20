@@ -1,6 +1,21 @@
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
+import { Search, Globe, MessageSquare, Megaphone, Inbox, Wrench } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import type { SSEEvent } from "@/lib/types";
+
+/** Map tool names to a glyph + plain-language verb so the event log reads
+ * at a glance: searching vs fetching a page vs messaging a peer. Falls back
+ * to the raw tool name for unknown (crw/MCP) tools. */
+function toolMeta(tool: string): { Icon: LucideIcon; verb: string } {
+  const t = tool.toLowerCase();
+  if (t.includes("scrape") || t.includes("fetch")) return { Icon: Globe, verb: "Fetching page" };
+  if (t.includes("search")) return { Icon: Search, verb: "Searching web" };
+  if (t.includes("broadcast")) return { Icon: Megaphone, verb: "Broadcasting to peers" };
+  if (t.includes("send_to")) return { Icon: MessageSquare, verb: "Messaging peer" };
+  if (t.includes("inbox")) return { Icon: Inbox, verb: "Checking inbox" };
+  return { Icon: Wrench, verb: tool };
+}
 
 const eventStyles: Record<string, { dot: string; bar: string }> = {
   model_load: { dot: "bg-event-info", bar: "border-l-event-info/40" },
@@ -63,6 +78,17 @@ function coalesce(events: SSEEvent[]): CoalescedItem[] {
     }
     if (event.type === "message.start" || event.type === "message.end") continue;
     if (event.type === "reasoning.start" || event.type === "reasoning.end") continue;
+    // Our tool loop never emits these LM Studio-native events, and
+    // EventContent renders them as blank rows — drop rather than paint dots
+    // with no text.
+    if (
+      event.type === "chat.start" ||
+      event.type === "chat.end" ||
+      event.type.startsWith("model_load") ||
+      event.type.startsWith("prompt_processing")
+    ) {
+      continue;
+    }
     out.push({ kind: "event", event });
   }
   return out;
@@ -127,24 +153,49 @@ function EventContent({ event }: { event: SSEEvent }) {
       return <span className="text-primary">Reasoning…</span>;
     case "reasoning.delta":
       return <span className="text-primary/80 text-[10px] italic">{event.content}</span>;
-    case "tool_call.start":
+    case "tool_call.start": {
+      const { Icon, verb } = toolMeta(event.tool);
       return (
         <div className="flex items-center gap-1.5">
-          <Badge variant="secondary" className="text-[10px] font-mono">{event.tool}</Badge>
+          <Icon className="size-3 shrink-0 text-muted-foreground" />
+          <Badge variant="secondary" className="text-[10px]">{verb}</Badge>
         </div>
       );
+    }
     case "tool_call.arguments": {
       const args = event.arguments;
       const pairs = Object.entries(args).slice(0, 4);
       return (
         <div className="flex flex-wrap gap-x-2 gap-y-0.5 pt-0.5">
-          {pairs.map(([k, v]) => (
-            <span key={k} className="text-muted-foreground text-[10px]">
-              <span className="text-foreground/60">{k}</span>
-              <span className="mx-0.5">=</span>
-              <span className="text-foreground/80">{shorten(String(v), 40)}</span>
-            </span>
-          ))}
+          {pairs.map(([k, v]) => {
+            const s = String(v);
+            if (k === "url" && /^https?:\/\//i.test(s)) {
+              // URLs are real destinations — make them clickable and readable.
+              return (
+                <a
+                  key={k}
+                  href={s}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="max-w-[280px] truncate text-[10px] text-primary/80 transition-colors hover:text-primary hover:underline"
+                >
+                  {s.replace(/^https?:\/\//i, "").replace(/^www\./, "")}
+                </a>
+              );
+            }
+            if (k === "query") {
+              return (
+                <span key={k} className="text-[10px] text-foreground/80 italic">“{shorten(s, 60)}”</span>
+              );
+            }
+            return (
+              <span key={k} className="text-muted-foreground text-[10px]">
+                <span className="text-foreground/60">{k}</span>
+                <span className="mx-0.5">=</span>
+                <span className="text-foreground/80">{shorten(s, 40)}</span>
+              </span>
+            );
+          })}
           {Object.keys(args).length > 4 && (
             <span className="text-muted-foreground/50 text-[10px]">+{Object.keys(args).length - 4} more</span>
           )}

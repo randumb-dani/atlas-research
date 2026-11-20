@@ -42,7 +42,7 @@ export function SubagentSourceList({ sources, max = 0, className }: SubagentSour
             <span
               className={cn(
                 "px-1 py-0.5 rounded text-[9px] font-medium shrink-0",
-                source.status === "success" ? "bg-green-500/10 text-green-500" : "bg-destructive/10 text-destructive",
+                source.status === "success" ? "bg-success-muted text-success" : "bg-destructive/10 text-destructive",
               )}
             >
               {source.status}

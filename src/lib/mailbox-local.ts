@@ -44,16 +44,24 @@ export function resetCycleAgents() {
   activeAgents.clear();
 }
 
+/**
+ * Notes folded into the compile prompt by the last collectUndelivered() call.
+ * Kept so a RETRIED compile sees the same notes again (the inboxes have been
+ * consumed), while a second compile can't re-fold them a second time.
+ */
+let collectedNotes: string[] = [];
+
 export function resetMailbox() {
   messages.clear();
   activeAgents.clear();
   knownAgents.clear();
+  collectedNotes = [];
 }
 
 const TOOL_DEFS: McpToolDef[] = [
   {
     name: "send_to_subagent",
-    description: "Send a message to another subagent. Use this to share findings or ask a question if it would meaningfully improve your research.",
+    description: "Send a message to one specific peer by their internal key. Use it to share findings, flag a contradiction, or ask a question — even a one-line pointer to a source is worth sending. Messages to peers who have already finished are still preserved and folded into the final synthesis.",
     inputSchema: {
       type: "object",
       properties: {
@@ -65,7 +73,7 @@ const TOOL_DEFS: McpToolDef[] = [
   },
   {
     name: "check_inbox",
-    description: "Check for incoming messages from other subagents addressed to you. Non-destructive: messages you've already seen via check_inbox or an auto-delivered notice will keep showing up here until they're consumed by your final report, so it's safe to call this as often as you like without losing anything.",
+    description: "Check for incoming messages from other subagents addressed to you. Non-destructive: calling this does not consume anything — unread messages will also be delivered automatically at the start of your next turn, so seeing one here and again then is expected. You don't need to call this defensively.",
     inputSchema: {
       type: "object",
       properties: {
@@ -165,20 +173,25 @@ export function mailboxToolSource(): ToolSource {
   };
 }
 
-/** Returns all unread messages across every agent's inbox without clearing them.
- * In practice this surfaces messages sent to agents whose inbox was never
- * drained again after they finished (a still-active recipient's inbox is
- * drained every turn by the tool loop and will normally be empty by the time
- * this runs at compile). Call once, at compile time, after all subagents in
- * every cycle have finished. */
+/**
+ * Returns the unread messages across every agent's inbox, folded for the
+ * compile prompt, and CONSUMES them. Consumption + a retained snapshot makes
+ * the call idempotent: a retried compile sees the same notes, but a second
+ * compile never re-folds the same message twice (previously the inboxes were
+ * left intact, so every compile re-surfaced notes already folded — and keys
+ * with emptied inboxes accumulated forever).
+ */
 export function collectUndelivered(): string[] {
-  const undelivered: string[] = [];
   for (const [key, inbox] of messages) {
     if (inbox.length > 0) {
-      undelivered.push(`--- Messages for ${key} ---\n${inbox.join("\n---\n")}`);
+      collectedNotes.push(`--- Messages for ${key} ---\n${inbox.join("\n---\n")}`);
     }
+    // Nothing pending for this key (drained, consumed, or never used) — drop
+    // the entry so long runs don't accumulate stale inboxes. A later send
+    // recreates it; peek/drain on a missing key already return empty.
+    messages.delete(key);
   }
-  return undelivered;
+  return [...collectedNotes];
 }
 
 /** Returns unread messages for a single agent without clearing the inbox. */
